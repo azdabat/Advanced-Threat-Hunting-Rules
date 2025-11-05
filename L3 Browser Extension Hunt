@@ -1,0 +1,108 @@
+//  Malicious Browser Extension Detection (basic hunt will always catch)
+//Author: Ala Dabat
+// Source: External malicious extension list
+// Purpose: Threat Hunting malicious browser extensions loaded on endpoints
+
+let MaliciousExtensions = externaldata (
+    browser_extension: string, browser_extension_id: string, metadata_category: string, 
+    metadata_type: string, metadata_link: string, metadata_comment: string
+)
+["https://raw.githubusercontent.com/mthcht/awesome-lists/refs/heads/main/Lists/Browser%20Extensions/browser_extensions_list.csv"]
+with (format="csv", ignoreFirstRecord=true)
+| extend NormalizedExtensionID = trim(" ", tolower(browser_extension_id))
+| where isnotempty(NormalizedExtensionID) and metadata_type !in ("sensitive", "deceptive");  
+
+DeviceFileEvents
+| where ActionType == "FileCreated" and FileName endswith ".crx"
+| extend NormalizedExtractedID = trim(" ", tolower(extract(@"([a-zA-Z0-9]{32})", 1, FileName)))
+| where isnotempty(NormalizedExtractedID)
+| join kind=inner MaliciousExtensions on $left.NormalizedExtractedID == $right.NormalizedExtensionID
+| project Timestamp, DeviceName, FileName, FolderPath, ActionType, InitiatingProcessFileName, InitiatingProcessCommandLine, SHA256, 
+          browser_extension, metadata_category, metadata_type, metadata_link, metadata_comment
+
+
+
+------------------------------------------------------------------------------------
+L3 Attack Chain Hunt
+------------------------------------------------------------------------------------
+
+// -----------------------------
+// Malicious Browser Extension Hunt (improved, scored)
+// - Start with DeviceFileEvents (created .crx or extension folder writes)
+// - Enrich with DeviceProcessEvents (initiating process), DeviceNetworkEvents (immediate network activity)
+// - Add org-prevalence for SHA256 to reduce noise
+// - Cross-check with MaliciousExtensions feed (replace with Sentinel Watchlist in prod)
+// -----------------------------
+
+// CONFIG
+let lookback = 14d;
+let feedUrl = "https://raw.githubusercontent.com/mthcht/awesome-lists/refs/heads/main/Lists/Browser%20Extensions/browser_extensions_list.csv";
+let MaliciousExtensions = externaldata (
+    browser_extension: string, browser_extension_id: string, metadata_category: string, 
+    metadata_type: string, metadata_link: string, metadata_comment: string
+)
+[feedUrl]
+with (format="csv", ignoreFirstRecord=true)
+| extend MalExtID = trim(" ", tolower(browser_extension_id))
+| where isnotempty(MalExtID) and metadata_type !in ("sensitive","deceptive");
+
+// 1) prevalence table for file hashes (helps suppress common/benign files)
+let OrgPrevalence = DeviceFileEvents
+| where Timestamp >= ago(30d)
+| summarize DeviceCount = dcount(DeviceId), FirstSeen = min(Timestamp), LastSeen = max(Timestamp) by SHA256, FileName, FolderPath;
+
+// 2) candidate extension files (CRX files or extracted extension folders)
+let extFiles = DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FolderCreated")
+| extend FileNameLower = tolower(FileName), FolderPathLower = tolower(FolderPath)
+// .crx file uploaded/created
+| where FileNameLower endswith ".crx" 
+// OR extension drop into browser Extensions dir (chrome/firefox path heuristics)
+    or FolderPathLower has @"\extensions\" or FolderPathLower has @"\chrome\user data" or FolderPathLower has @"\mozilla\extensions"
+| extend ExtractedID = 
+    // try to pull id from filename or folder path (common patterns)
+    coalesce(
+      tostring(extract(@"([a-z0-9]{32})",1, tolower(FileName))), 
+      tostring(extract(@"\\extensions\\([^\\]+)\\",1, FolderPathLower)),
+      tostring(extract(@"extensions\\([^\\]+)\\",1, FolderPathLower))
+    )
+| extend ExtractedID = trim(" ", tolower(ExtractedID))
+| where isnotempty(ExtractedID)
+| project Timestamp, DeviceName, DeviceId, SHA256, FileName, FolderPath, ActionType, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName, ExtractedID;
+
+// 3) join to malicious feed
+let matched = extFiles
+| join kind=inner (MaliciousExtensions) on $left.ExtractedID == $right.MalExtID
+| project Timestamp, DeviceName, DeviceId, SHA256, FileName, FolderPath, ActionType, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName, browser_extension, metadata_category, metadata_type, metadata_link, metadata_comment, ExtractedID;
+
+// 4) enrich: immediate process & network within +/- 5 minutes
+let proc_enrich = DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| project ProcTime = Timestamp, DeviceId, DeviceName, ProcFile = FileName, ProcCmd = ProcessCommandLine, ProcAccount = InitiatingProcessAccountName, ProcParent = InitiatingProcessFileName, ProcSHA = InitiatingProcessSHA256, ProcessId;
+
+let net_enrich = DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| project NetTime = Timestamp, DeviceId, DeviceName, RemoteIP, RemotePort, RemoteUrl, BytesSent, BytesReceived, InitiatingProcessFileName, InitiatingProcessCommandLine;
+
+// 5) correlate matched extension creation to process & net events in short window and enrich with org prevalence
+matched
+| extend matchTime = Timestamp
+| join kind=leftouter (proc_enrich) on $left.DeviceId == $right.DeviceId
+| where ProcTime between (matchTime - 5m .. matchTime + 5m)
+| join kind=leftouter (net_enrich) on $left.DeviceId == $right.DeviceId
+| where NetTime between (matchTime - 5m .. matchTime + 5m) or isnull(NetTime)
+// bring in prevalence
+| join kind=leftouter (OrgPrevalence) on $left.SHA256 == $right.SHA256
+| extend DeviceCount = coalesce(DeviceCount, 0), IsRare = iff(DeviceCount <= 2, 1, 0)
+// scoring: independent signals
+| extend Score = 
+    // Malicious feed match guarantees base score
+    2
+    + (iif(isnotempty(ProcFile) and ProcFile in~ ("chrome.exe","msedge.exe","firefox.exe","iexplore.exe"), 1, 0))   // loaded by browser process
+    + (iif(ProcCmd has_any ("GetUserSPNs","Invoke-WebRequest","eval(","fetch(","XMLHttpRequest","appendChild("), 1, 0)) // suspicious cmdline content
+    + (iif(isnotempty(RemoteIP) or isnotempty(RemoteUrl), 1, 0))  // network behavior shortly after install
+    + (iif(IsRare == 1, 1, 0)) // rare file across org
+| where Score >= 3   // tune: 3 = medium, 4+ = high fidelity
+| project Timestamp = matchTime, DeviceName, DeviceId, InitiatingProcessAccountName, FileName, FolderPath, SHA256, ExtractedID, browser_extension, metadata_category, metadata_type, metadata_link, metadata_comment, ProcFile, ProcCmd, RemoteIP, RemoteUrl, DeviceCount, Score
+| order by Score desc, Timestamp desc;
