@@ -1,0 +1,20 @@
+// Malicious Browser Extension Detection
+// Source: External malicious extension list
+// Purpose: Threat Hunting malicious browser extensions loaded on endpoints - 
+
+let MaliciousExtensions = externaldata (
+    browser_extension: string, browser_extension_id: string, metadata_category: string, 
+    metadata_type: string, metadata_link: string, metadata_comment: string
+)
+["https://raw.githubusercontent.com/mthcht/awesome-lists/refs/heads/main/Lists/Browser%20Extensions/browser_extensions_list.csv"]
+with (format="csv", ignoreFirstRecord=true)
+| extend NormalizedExtensionID = trim(" ", tolower(browser_extension_id))
+| where isnotempty(NormalizedExtensionID) and metadata_type !in ("sensitive", "deceptive");  
+
+DeviceFileEvents
+| where ActionType == "FileCreated" and FileName endswith ".crx"
+| extend NormalizedExtractedID = trim(" ", tolower(extract(@"([a-zA-Z0-9]{32})", 1, FileName)))
+| where isnotempty(NormalizedExtractedID)
+| join kind=inner MaliciousExtensions on $left.NormalizedExtractedID == $right.NormalizedExtensionID
+| project Timestamp, DeviceName, FileName, FolderPath, ActionType, InitiatingProcessFileName, InitiatingProcessCommandLine, SHA256, 
+          browser_extension, metadata_category, metadata_type, metadata_link, metadata_comment
