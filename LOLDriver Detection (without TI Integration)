@@ -6,188 +6,87 @@
 // Wont catch modern BYOVD attacks in 2025 for Zero-days (see MISP section for rule update)
 // ==============================
 
-let VulnerableDriverData = externaldata (
-    Id:string, Author:string, Created:string, Command:string, Description:string, Usecase:string, Category:string, Privileges:string, MitreID:string, OperatingSystem:string, Resources:string, DriverInfo:string, ContactPerson:string, HandleReference:string, DetectionMethod:string, MD5_Hashes:string, SHA1_Hashes:string, SHA256_Hashes:string, PublisherInfo:string, CompanyInfo:string, VulnerabilityDetails:string, MD5_Authentihash:string, SHA256_Authentihash:string, SHA1_Authentihash:string, VerificationStatus:string, TagsInfo:string
-) ["https://www.loldrivers.io/api/drivers.csv"] with (format="csv", ignoreFirstRecord=true);
+// Advanced Malicious & Vulnerable Driver Detection
+// MITRE: TA0005, TA0004 | T1068, T1548, T1562
+// Tables: DeviceEvents, DeviceFileEvents, ThreatIntelligenceIndicator (or external driver hash feed)
+// Author: Alstrum Dabat | Version: 2025-11
+// Description: Detects loading of malicious or vulnerable kernel-mode drivers, including signed-abuse and delayed-activation scenarios.
 
-let VulnerableDriversSHA256 = VulnerableDriverData
-| extend IndividualSHA256 = split(SHA256_Hashes, ', ')
-| mv-expand IndividualSHA256
-| where isnotempty(IndividualSHA256)
-| extend NormalizedSHA256 = trim(" ", tolower(IndividualSHA256));
-
-let LoadedDrivers = DeviceEvents
-| where ActionType has "DriverLoad"
-| extend NormalizedDeviceSHA256 = trim(" ", tolower(SHA256));
-
-LoadedDrivers
-| join kind=inner VulnerableDriversSHA256 on $left.NormalizedDeviceSHA256 == $right.NormalizedSHA256
-| where not(FileName == "DBUtilDrv2.sys" and Category != "Vulnerable Driver")
-| summarize arg_max(Timestamp, *) by DeviceName, NormalizedDeviceSHA256
-| extend VT_Domain = iff(isnotempty(NormalizedDeviceSHA256), strcat("https://www.virustotal.com/gui/file/", NormalizedDeviceSHA256), NormalizedDeviceSHA256)
-| project-away ContactPerson, HandleReference;
-
-
-
-
-
-// ==============================
-// Malicious Driver Hunt (SOC Threat Hunting)
-// Source: LOLDrivers CSV schema (matches your attached file)
-// Default: ONLY Category == "malicious"
-// To also include vulnerable drivers, UNCOMMENT the block marked "OPTIONAL: include vulnerable"
-// ==============================
-
-let lookback = 30d;
-
-// --- 1) Load the driver catalog (schema matches your uploaded CSV) ---
-let DriverCatalogRaw = materialize(
-    externaldata(
-        Id:string,
-        Author:string,
-        Created:string,
-        Command:string,
-        Description:string,
-        Usecase:string,
-        Category:string,
-        Privileges:string,
-        MitreID:string,
-        OperatingSystem:string,
-        Resources:string,
-        ['Driver Description']:string,
-        Person:string,
-        Handle:string,
-        Detection:string,
-        KnownVulnerableSamples_MD5:string,
-        KnownVulnerableSamples_SHA1:string,
-        KnownVulnerableSamples_SHA256:string,
-        KnownVulnerableSamples_Authentihash_MD5:string,
-        KnownVulnerableSamples_Authentihash_SHA1:string,
-        KnownVulnerableSamples_Authentihash_SHA256:string,
-        Verified:string,
-        Tags:string
-    )
-    ["https://www.loldrivers.io/api/drivers.csv"]
-    with (format="csv", ignoreFirstRecord=true)
-    // keep only the columns we use downstream
-    | project
-        Id,
-        Category,
-        Privileges,
-        DriverDescription = ['Driver Description'],
-        Detection,
-        Verified,
-        Tags,
-        MD5s  = KnownVulnerableSamples_MD5,
-        SHA1s = KnownVulnerableSamples_SHA1,
-        SHA256s = KnownVulnerableSamples_SHA256,
-        AuthMD5  = KnownVulnerableSamples_Authentihash_MD5,     // reference only; not used for matching
-        AuthSHA1 = KnownVulnerableSamples_Authentihash_SHA1,    // reference only; not used for matching
-        AuthSHA256 = KnownVulnerableSamples_Authentihash_SHA256 // reference only; not used for matching
+let LookbackDays = 30d;
+let suspicious_paths = dynamic(["\\temp\\","\\downloads\\","\\users\\","\\appdata\\","\\programdata\\"]);
+//
+// === OPTIONAL HASH FEED (replace with your external feed or MISP ingestion ===
+// Example: DriverHashFeed
+let DriverHashFeed = materialize(externaldata(Id:string,Category:string,Privileges:string,DriverDescription:string,Detection:string,Verified:string,Tags:string,Hash:string,HashType:string)
+    ["https://your-misp-or-csv-feed-location/drivers.csv"]
+    with(format="csv", ignoreFirstRecord=True)
+    | extend Hash = tolower(trim(" ", Hash))
 );
-
-// --- 2) Select rows to hunt: default = malicious only ---
-// OPTIONAL: include vulnerable records by UNCOMMENTING the indicated line
-let CatalogForHunt =
-    DriverCatalogRaw
-    | extend Category_l = tolower(coalesce(Category, ""))
-    | where Category_l == "malicious"
-    // | where Category_l == "malicious" or Category_l startswith "vulnerable"   // <-- OPTIONAL: include vulnerable
-
-;
-
-// --- 3) Explode known sample hashes (SHA256/SHA1/MD5) into a unified hash feed ---
-// Note: DeviceEvents exposes SHA256/SHA1/MD5 (no "authentihash"), so we match on these three.
-let DriverHashFeed = materialize(
-    union
-        (CatalogForHunt
-            | extend HashList = split(replace_string(coalesce(SHA256s,""), ";", ","), ",")
-            | mv-expand HashList to typeof(string)
-            | extend Hash = tolower(trim(@" \t\r\n""'", HashList))
-            | where isnotempty(Hash)
-            | project Id, Category, Privileges, DriverDescription, Detection, Verified, Tags, Hash, HashType="SHA256")
-    ,
-        (CatalogForHunt
-            | extend HashList = split(replace_string(coalesce(SHA1s,""), ";", ","), ",")
-            | mv-expand HashList to typeof(string)
-            | extend Hash = tolower(trim(@" \t\r\n""'", HashList))
-            | where isnotempty(Hash)
-            | project Id, Category, Privileges, DriverDescription, Detection, Verified, Tags, Hash, HashType="SHA1")
-    ,
-        (CatalogForHunt
-            | extend HashList = split(replace_string(coalesce(MD5s,""), ";", ","), ",")
-            | mv-expand HashList to typeof(string)
-            | extend Hash = tolower(trim(@" \t\r\n""'", HashList))
-            | where isnotempty(Hash)
-            | project Id, Category, Privileges, DriverDescription, Detection, Verified, Tags, Hash, HashType="MD5")
-)
-| summarize any(Id), any(Category), any(Privileges), any(DriverDescription), any(Detection), any(Verified), any(Tags) by Hash, HashType
-| project
-    Hash,
-    HashType,
-    Id                = any_Id,
-    Category          = any_Category,
-    Privileges        = any_Privileges,
-    DriverDescription = any_DriverDescription,
-    Detection         = any_Detection,
-    Verified          = any_Verified,
-    Tags              = any_Tags
-;
-
-// --- 4) Collect driver load telemetry from endpoints (last 30 days by default) ---
-let DriverLoads =
-    DeviceEvents
-    | where Timestamp >= ago(lookback)
-    | where ActionType has_any ("DriverLoad","LoadedKernelModule")
-    | extend
-        FileName   = tostring(FileName),
-        FolderPath = tostring(FolderPath),
-        SHA256_l   = tolower(tostring(SHA256)),
-        SHA1_l     = tolower(tostring(SHA1)),
-        MD5_l      = tolower(tostring(MD5))
-    | project Timestamp, DeviceId, DeviceName, FileName, FolderPath,
-              InitiatingProcessFileName, InitiatingProcessCommandLine,
-              SHA256_l, SHA1_l, MD5_l
-;
-
-// --- 5) Match any observed driver loads to the malicious (or optional vulnerable) hash feed ---
-DriverLoads
-| extend HashCandidates = pack_array(SHA256_l, SHA1_l, MD5_l)
-| mv-expand HashCandidates
-| extend Hash = tolower(tostring(HashCandidates))
-| where isnotempty(Hash)
-| join kind=inner (DriverHashFeed) on Hash
-// --- 6) Present results clearly for a hunter ---
-| summarize
-    FirstSeen   = min(Timestamp),
-    LastSeen    = max(Timestamp),
-    LoadCount   = count(),
-    SampleProc  = arg_max(Timestamp, InitiatingProcessFileName),
-    SampleCmd   = arg_max(Timestamp, InitiatingProcessCommandLine),
-    SampleFile  = any(FileName),
-    SamplePath  = any(FolderPath)
-  by DeviceId, DeviceName, Hash, HashType, Id, Category, Privileges, DriverDescription, Detection, Verified, Tags
-| extend
-    HitClass = iif(tolower(Category) == "malicious", "MALICIOUS", "VULNERABLE"),  // will read MALICIOUS unless you enabled vulnerable
-    VT_File  = strcat("https://www.virustotal.com/gui/file/", Hash),
-    MITRE_Tactics    = "TA0005: Defense Evasion; TA0004: Privilege Escalation",
-    MITRE_Techniques = "T1068; T1548; T1562",
-    HuntingDirectives = pack_array(
-        strcat("1) Confirm if driver '", SampleFile, "' (", HashType, "=", Hash, ") is expected on ", DeviceName, "."),
-        strcat("2) Class: ", HitClass, " (Category=", Category, ") | Description: ", coalesce(DriverDescription,"n/a")),
-        strcat("3) Loader: ", tostring(SampleProc), " | Cmd: ", tostring(SampleCmd)),
-        "4) Enrich: check signature status & driver catalog entries; open VT link for this file hash.",
-        strcat("5) VT: ", VT_File),
-        "6) Pivot estate-wide by Hash and FileName in DeviceEvents and DeviceFileEvents.",
-        "7) Hunt for post-load abuse: EDR service tampering, AMSI/ETW patching, LSASS access, or suspicious IOCTL activity.",
-        "8) If MALICIOUS: isolate host, capture memory, remove/contain driver, and apply WDAC/HVCI controls.",
-        "9) If VULNERABLE (enabled option): contact owner, update/replace driver, or add WDAC deny rule."
-    )
-| project
-    FirstSeen, LastSeen, LoadCount,
-    DeviceName, DeviceId,
-    SampleFile, SamplePath,
-    Hash, HashType,
-    HitClass, Category, Privileges, DriverDescription, Detection, Verified, Tags,
-    VT_File, MITRE_Tactics, MITRE_Techniques, HuntingDirectives
-| order by case(HitClass == "MALICIOUS", 2, 1) desc, LastSeen desc
+//
+// === FILE CREATION EVENTS (for delay analysis) ===
+let FileCreates = DeviceFileEvents
+| where TimeGenerated >= ago(LookbackDays)
+| where ActionType in ("FileCreated","FileMoved")
+| extend CreatedTime = TimeGenerated
+| project DeviceId, DeviceName, FileName, FolderPath, SHA256 = tolower(SHA256), CreatedTime;
+//
+// === DRIVER LOAD EVENTS ===
+let DriverLoads = DeviceEvents
+| where TimeGenerated >= ago(LookbackDays)
+| where ActionType has_any ("DriverLoad","LoadedKernelModule")
+| extend SHA256_l = tolower(SHA256),
+         FolderPath_l = tolower(FolderPath),
+         FileName_l = tolower(FileName),
+         LoadTime = TimeGenerated
+| project DeviceId, DeviceName, FileName, FolderPath, SHA256_l, LoadTime,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          Signer = iff(isnull(Signer), SignatureSubject, Signer),
+          SignatureStatus = iff(isnull(SignatureStatus), "Unknown", SignatureStatus);
+//
+// === JOIN CREATION TIME (to identify delayed activation or fast activation) ===
+let Joined = DriverLoads
+| join kind=leftouter (
+    FileCreates
+) on DeviceId, FileName
+| extend time_to_load_mins = iff(isnull(CreatedTime), -1, datetime_diff("minute", LoadTime, CreatedTime));
+//
+// === JOIN HASH FEED (known malicious or vulnerable) ===
+let Enriched = Joined
+| join kind=leftouter (
+    DriverHashFeed
+) on $left.SHA256_l == $right.Hash
+| extend HitClass = case(Category == "malicious", "MALICIOUS",
+                         Category == "vulnerable driver", "VULNERABLE",
+                         "UNKNOWN");
+//
+// === PATH & SIGNATURE HEURISTICS ===
+Enriched
+| extend PathSuspicious = iff(FolderPath_l has_any(suspicious_paths)
+                          or not(FolderPath_l startswith "c:\\windows\\system32\\drivers"), 1, 0),
+         SignatureAnomaly = iff(SignatureStatus !in ("Valid","Good") or isempty(Signer) or Signer has_any("unknown","untrusted"), 1, 0),
+         LoadDelayCategory = case(time_to_load_mins == -1, "Unknown",
+                                  time_to_load_mins < 5, "Immediate (<5min)",
+                                  time_to_load_mins > 10080, "Delayed (>7d)",
+                                  "Normal"),
+         VT_File = strcat("https://www.virustotal.com/gui/file/", SHA256_l),
+         MITRE_Tactics = "TA0005: Defense Evasion; TA0004: Privilege Escalation",
+         MITRE_Techniques = "T1068; T1548; T1562",
+         HuntingDirectives = strcat(
+             "1) Confirm driver '", FileName, "' on ", DeviceName, ". ",
+             "2) Category=", HitClass, " | Description=", DriverDescription, ". ",
+             "3) PathSuspicious=", tostring(PathSuspicious), " | SignatureAnomaly=", tostring(SignatureAnomaly), ". ",
+             "4) Loader: ", InitiatingProcessFileName, " | Cmd: ", InitiatingProcessCommandLine, ". ",
+             "5) Delay Category=", LoadDelayCategory, " (", tostring(time_to_load_mins), " mins). ",
+             "6) Enrich via VT: ", VT_File, ". ",
+             "7) Pivot on hash & filename across estate. ",
+             "8) Hunt for post-load actions (EDR tamper, LSASS, AMSI patching, etc.). ",
+             "9) Respond: isolate, memory capture, driver removal, WDAC/HVCI update if malicious; vendor remediation if vulnerable."
+         )
+| where HitClass in ("MALICIOUS","VULNERABLE") or PathSuspicious == 1 or SignatureAnomaly == 1
+| project LoadTime, DeviceName, DeviceId, FileName, FolderPath, SHA256_l, HitClass, Category,
+          Privileges, DriverDescription, Detection, Verified, Tags,
+          PathSuspicious, SignatureAnomaly, LoadDelayCategory,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          Signer, SignatureStatus,
+          VT_File, MITRE_Tactics, MITRE_Techniques, HuntingDirectives
+| order by HitClass desc, PathSuspicious desc, SignatureAnomaly desc, LoadTime desc
