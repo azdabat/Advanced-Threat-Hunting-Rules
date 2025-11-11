@@ -1,59 +1,91 @@
-let lookback = 60m;
-let confidence_threshold = 3;
-let suspicious_folders = dynamic(["C:\\Users\\Public\\", "C:\\ProgramData\\", "C:\\Temp\\", "C:\\Users\\", "C:\\Windows\\Tasks\\"]);
+let lookback = 14d;
+let suspicious_folders = dynamic(["C:\\ProgramData\\", "C:\\Users\\", "C:\\Temp\\", "C:\\Windows\\Tasks\\"]);
 let writable_driver_locations = dynamic(["C:\\ProgramData\\", "C:\\Users\\", "C:\\Temp\\", "C:\\Windows\\Tasks\\"]);
 let registry_keywords = dynamic([".dll", ".exe", ".ps1", ".bat", ".vbs", ".cmd", ".js", "rundll32.exe", "mshta.exe", "powershell.exe", "cmd.exe"]);
-let known_malicious_hashes = dynamic(["f1e2d3c4b5a6..."]); // Replace with known-bad hashes
+let known_malicious_hashes = dynamic(["f1e2d3c4b5a6..."]); // replace with threat intel feed
+let now = datetime("2025-11-11T13:21:25Z");
+let cutoff_dormant = now - 7d;
+let confidence_threshold = 3;
 
-// DLL Load Events
-let dll_loads = DeviceImageLoadEvents
-| where Timestamp >= ago(lookback)
-| where ImageFileName endswith ".dll"
-| where (Signed == "False" or isnull(Signer) or SignatureStatus has_any ("Unsigned", "Unknown", "Invalid"))
-| extend FolderPath = tostring(split(ImageFileName, "\\", -2)[0])
-| project LoadTime = Timestamp, DeviceName, ProcessId, ProcessName, ImageFileName, ImageHash, FolderPath;
-
-// File Creations
+// Step 1: File drops (DLL or Driver)
 let file_drops = DeviceFileEvents
 | where Timestamp >= ago(lookback)
 | where FolderPath startswith_any (suspicious_folders)
 | where FileName endswith ".dll" or FileName endswith ".sys"
-| project DropTime = Timestamp, DeviceName, FileName, FileHash, FolderPath, InitiatingProcessFileName, InitiatingProcessCommandLine;
+| extend FileExt = tostring(split(FileName, ".", -1)[-1])
+| extend IsDriver = iff(FileName endswith ".sys", 1, 0)
+| extend IsDLL = iff(FileName endswith ".dll", 1, 0)
+| project DropTime = Timestamp, DeviceName, FileName, FileHash, FolderPath, IsDriver, IsDLL, InitiatingProcessFileName;
 
-// Downloads
-let net_downloads = DeviceNetworkEvents
+// Step 2: DLL / SYS image loads
+let image_loads = DeviceImageLoadEvents
 | where Timestamp >= ago(lookback)
-| where RemoteUrl has_any (".dll", ".sys", ".bin", ".exe")
-| project DownloadTime = Timestamp, DeviceName, RemoteUrl, InitiatingProcessFileName;
+| where ImageFileName endswith ".dll" or ImageFileName endswith ".sys"
+| where (Signed == "False" or isnull(Signer) or SignatureStatus has_any ("Unsigned", "Unknown", "Invalid"))
+| project LoadTime = Timestamp, DeviceName, ProcessName, ImageFileName, ImageHash;
 
-// Registry Events (all persistence types)
+// Step 3: Registry Persistence Indicators
 let reg_persistence = DeviceRegistryEvents
 | where Timestamp >= ago(lookback)
 | where RegistryValueData has_any (registry_keywords)
-| project RegTime = Timestamp, DeviceName, RegistryKey, RegistryValueName, RegistryValueData, InitiatingProcessFileName;
+| project RegTime = Timestamp, DeviceName, RegistryKey, RegistryValueData, InitiatingProcessFileName;
 
-// Merge All Signals
-dll_loads
-| join kind=leftouter (file_drops) on $left.ImageHash == $right.FileHash and $left.DeviceName == $right.DeviceName
+// Step 4: Network Downloads
+let net_downloads = DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemoteUrl has_any (".dll", ".sys", ".exe", ".bin")
+| project DownloadTime = Timestamp, DeviceName, RemoteUrl, InitiatingProcessFileName;
+
+// Step 5: Correlate DLL Loads ↔ File Drops
+file_drops
+| join kind=leftouter (image_loads) on $left.DeviceName == $right.DeviceName and $left.FileHash == $right.ImageHash
 | join kind=leftouter (net_downloads) on $left.DeviceName == $right.DeviceName
 | join kind=leftouter (reg_persistence) on $left.DeviceName == $right.DeviceName
+| extend LoadDelayMin = datetime_diff("minute", LoadTime, DropTime)
 | extend
-    ConfidenceScore =
-        iif(ImageHash in (known_malicious_hashes), 5,
+    SuspiciousDLLFast = iff(IsDLL == 1 and LoadDelayMin >= 0 and LoadDelayMin <= 5, 1, 0),
+    DormantDriver = iff(IsDriver == 1 and DropTime <= ago(7d) and (isnull(LoadTime) or LoadTime > now), 1, 0),
+    ConfidenceScore = 
+        iif(FileHash in (known_malicious_hashes), 5,
         iif(FolderPath startswith_any (writable_driver_locations), 2, 0) +
         iif(isnotempty(RegistryKey), 2, 0) +
-        iif(RemoteUrl has ".dll", 1, 0)),
-    MITRE_Tactics = "T1574.001, T1547.001, T1036.005, T1055.001, T1543.003",
+        iif(RemoteUrl has_any (".dll", ".sys"), 1, 0) +
+        iif(SuspiciousDLLFast == 1, 2, 0) +
+        iif(DormantDriver == 1, 3, 0)),
+    Reason =
+        case(
+            FileHash in (known_malicious_hashes), " Known Malicious Hash",
+            SuspiciousDLLFast == 1, " DLL loaded <5m after drop",
+            DormantDriver == 1, "Driver dormant >7d and unused",
+            isnotempty(RegistryKey), " Registry Persistence",
+            RemoteUrl has_any (".dll", ".sys"), " Remote download",
+            FolderPath startswith_any(writable_driver_locations), " Dropped in writable folder",
+            "—"
+        ),
+    MITRE_Techniques =
+        strcat_array(
+            array_distinct(
+                pack_array(
+                    iff(SuspiciousDLLFast == 1, "T1574.001", ""),
+                    iff(DormantDriver == 1, "T1543.003", ""),
+                    iff(isnotempty(RegistryKey), "T1547.001", ""),
+                    iff(RemoteUrl has_any (".dll", ".sys"), "T1105", "")
+                )
+            ),
+            ", "
+        ),
     ThreatHunterNotes = strcat(
-        iif(ImageHash in (known_malicious_hashes), " Known bad hash. ", ""),
-        iif(FolderPath startswith_any(writable_driver_locations), " DLL/Driver drop in writable location. ", ""),
-        iif(isnotempty(RegistryKey), " Registry persistence via key: ", RegistryKey, ". "),
-        iif(isnotempty(RemoteUrl), strcat(" Download from: ", RemoteUrl, ". "), "")
+        iff(SuspiciousDLLFast == 1, " DLL rapidly executed after drop. ", ""),
+        iff(DormantDriver == 1, " Driver dormant >7 days with no load. ", ""),
+        iff(FolderPath startswith_any(writable_driver_locations), "File dropped in user-writable location. ", ""),
+        iff(isnotempty(RegistryKey), strcat("Registry Persistence Key: ", RegistryKey, ". "), ""),
+        iff(isnotempty(RemoteUrl), strcat("Downloaded from: ", RemoteUrl, ". "), "")
     )
 | where ConfidenceScore >= confidence_threshold
-| project
-    LoadTime, DropTime, DownloadTime, RegTime,
-    DeviceName, ProcessName, ImageFileName, ImageHash,
-    FileHash, FolderPath, RemoteUrl, RegistryKey, RegistryValueData,
-    ConfidenceScore, MITRE_Tactics, ThreatHunterNotes
-| order by LoadTime desc
+| project 
+    DropTime, LoadTime, DownloadTime, RegTime,
+    DeviceName, FileName, FileHash, FolderPath, ImageFileName,
+    LoadDelayMin, RemoteUrl, RegistryKey, RegistryValueData,
+    SuspiciousDLLFast, DormantDriver,
+    ConfidenceScore, Reason, ThreatHunterNotes, MITRE_Techniques
+| order by DropTime desc
