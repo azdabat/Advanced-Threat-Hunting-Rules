@@ -1,0 +1,96 @@
+Suspicious Port Threat Hunt
+High-Fidelity Detection With External CSV Intel + Full Process Attribution
+
+Author: Ala Dabat
+
+🧠 Overview
+
+This detection identifies any outbound or inbound connection using ports flagged as suspicious in a trusted open-source CSV feed.
+Unlike basic port-matching rules, this version includes real executable attribution, command line, parent process, signer, hash, MITRE mapping, and analyst hunting directives.
+
+The rule is designed for:
+
+Supply chain compromise detection
+
+C2 beacons over non-standard ports
+
+Malware using obscure ports
+
+Proxy / tunneling / SOCKS abuse
+
+Unknown services listening on unusual ports
+
+Zero-day or AI-generated implants using rare ports
+
+⭐ What This Rule Detects
+Category	Detected?	Description
+Suspicious outbound ports	🟩 Yes	Matches against CSV intel feed
+Malware using uncommon ports	🟩 Yes	C2, encrypted channels, tunneling
+Unsigned processes using flagged ports	🟩 Yes	Parent/child inspection enabled
+Abnormal command-line behaviour	🟩 Yes	Powershell, mshta, curl, rundll32
+Supply-chain malware C2	🟩 Yes	3CX / F5 style C2 over rare ports
+Multi-stage implants	🟩 Yes	Hash/signature extraction included
+❌ What This Rule Does NOT Detect (By Design)
+Missed Category	Reason
+Local-only malware without network traffic	No port usage to match
+Reverse shells on common ports (80/443)	Requires behavioural heuristics
+QUIC-specific C2	Encrypted UDP may hide port semantics
+Port-knocking sequences	Requires stateful long-window correlation
+Localhost/loopback C2	Explicitly filtered to reduce noise
+DNS-over-HTTPS C2	Not identified as port misuse
+
+If you want, I can generate a paired DoH / QUIC high-fidelity rule.
+
+🔗 Data Sources Used
+
+DeviceNetworkEvents
+
+DeviceProcessEvents (via join)
+
+External CSV containing suspicious port intel
+
+🧩 MITRE ATT&CK Coverage
+Tactic	Technique	Description
+TA0011 – Command & Control	T1071	Application layer protocol abuse
+	T1090	Proxy / tunneling activity
+	T1573	Encrypted channel C2
+🧭 Hunter Directives (SOC Analyst Workflow)
+
+Verify legitimacy of the process using this port.
+
+Check parent process → is this a LOLBin chain?
+
+Inspect command-line for encoded payloads, URLs, or staging.
+
+Check signer: unsigned or unknown = suspicious.
+
+Perform a VirusTotal lookup on the remote IP.
+
+Check number of events — beaconing = likely C2.
+
+Correlate with DeviceProcessEvents for deeper context.
+
+If behaviour persists, isolate the device and collect memory.
+
+🛠 CPU / Cost Notes
+
+Matching RemotePort against a scalar set is efficient.
+
+Joins use small metadata tables (low cost).
+
+arg_max() prevents massive output volume.
+
+The rule uses no expensive regex on the network stream.
+
+Low risk of CPU spikes; safe for continuous hunting.
+
+📄 Output Columns
+Column	Description
+DeviceName	Host involved
+RemoteIP	Suspicious destination
+RemotePort	Flagged port
+SampleProcess	The executable actually using the port
+SampleCommand	Command-line used
+MITRE_Tactics	ATT&CK mapping
+MITRE_Techniques	Exact technique
+HuntingDirectives	Analyst guidance
