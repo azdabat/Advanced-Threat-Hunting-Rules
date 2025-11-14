@@ -1,82 +1,88 @@
-// Suspicious Ports — Outbound/Any-Connection variant
-// Purpose: alert on any network connection using community-listed suspicious ports
-// Author: Ala Dabat (annotated)
+// Suspicious Port Threat Hunt — With Full Process Attribution
+// Author: Ala Dabat
 
-// 1) Pull in external CSV of suspicious ports. externaldata requires exact column order & types.
-//    We're declaring column types: dest_port:int, metadata_comment:string, metadata_confidence:string, ...
+// ---- Load external CSV of suspicious ports ----
 let SuspiciousPortsData =
-    externaldata(dest_port:int, metadata_comment:string, metadata_confidence:string,
-                 metadata_detection_type:string, metadata_link:string, metadata_reference:string)
-    [@"https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/suspicious_ports_list.csv"]
-    with (format='csv', ignoreFirstRecord=true)
-| where metadata_confidence != "low";                // drop low-confidence rows early to reduce noise
+    externaldata(
+        dest_port:int,
+        metadata_comment:string,
+        metadata_confidence:string,
+        metadata_detection_type:string,
+        metadata_link:string,
+        metadata_reference:string
+    )
+    ["https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/suspicious_ports_list.csv"]
+    with (format="csv", ignoreFirstRecord=true)
+    | where metadata_confidence != "low";
 
-// 2) Build a scalar set (array) of ports for fast membership tests in the main query
 let SuspiciousPortList = toscalar(SuspiciousPortsData | summarize make_set(dest_port));
 
-// 3) Keep a small projected table with port-level context for join/enrichment later
-let PortDetails = SuspiciousPortsData | project dest_port, metadata_comment, metadata_confidence;
+let PortDetails = SuspiciousPortsData
+| project dest_port, metadata_comment, metadata_confidence;
 
-// 4) Main telemetry source: DeviceNetworkEvents
+// ---- Main Hunt ----
 DeviceNetworkEvents
-| where RemotePort in (SuspiciousPortList)          // only keep events that match the suspicious ports
-| where RemotePort != 8080                           // example: ignore common benign port 8080 (tunable)
-| where RemoteIP !in~ ("::1", "::ffff:127.0.0.1")    // filter out loopback-like addresses
-| where not(
-      RemoteIP startswith "10."                      // exclude RFC1918 private ranges (tunable)
-      or RemoteIP startswith "192.168."
-      or RemoteIP startswith "172."
-      or RemoteIP startswith "8."                    // example public IP range exclusion (tunable)
-      or RemoteIP startswith "127."
-  )
-// 5) join with CSV metadata to attach context (inner join keeps only known ports)
-| join kind=inner (PortDetails) on $left.RemotePort == $right.dest_port
+| where RemotePort in (SuspiciousPortList)
+| where not(RemoteIP startswith "10." or RemoteIP startswith "192.168." or RemoteIP startswith "172.")
+| join kind=inner PortDetails on $left.RemotePort == $right.dest_port
 
-// 6) Aggregate to reduce noise and produce sampling values for triage
+// ---- Extract all relevant process telemetry ----
+| extend 
+    Proc = InitiatingProcessFileName,
+    ProcCL = InitiatingProcessCommandLine,
+    ProcSHA256 = InitiatingProcessSHA256,
+    ProcSigner = InitiatingProcessSigner,
+    ProcPath = InitiatingProcessFolderPath,
+    ParentProc = InitiatingProcessParentFileName,
+    User = InitiatingProcessAccountName
+
+// ---- Summaries for triage ----
 | summarize
-    FirstSeen=min(Timestamp),
-    LastSeen=max(Timestamp),
-    Count=count(),
-    SampleProcess=arg_max(Timestamp, InitiatingProcessFileName),
-    SampleCommand=arg_max(Timestamp, InitiatingProcessCommandLine)
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    Count = count(),
+    SampleProcess = arg_max(Timestamp, Proc),
+    SampleCommand = arg_max(Timestamp, ProcCL),
+    SampleHash = arg_max(Timestamp, ProcSHA256),
+    SampleSigner = arg_max(Timestamp, ProcSigner),
+    SampleParent = arg_max(Timestamp, ParentProc),
+    Users = make_set(User,10)
   by DeviceName, RemoteIP, RemotePort, metadata_comment, metadata_confidence
 
-// 7) Map CSV confidence to internal risk levels
+// ---- Risk Classification ----
 | extend RiskLevel = case(
     metadata_confidence == "high", "CRITICAL",
     metadata_confidence == "medium", "HIGH",
-    "MEDIUM"  // default
-  )
+    "MEDIUM"
+),
+MITRE_Tactics = "TA0011 Command and Control",
+MITRE_Techniques = case(
+    RemotePort == 1080, "T1090 Proxy",
+    RemotePort == 1194, "T1573 Encrypted Channel",
+    "T1071 Application Layer Protocol"
+),
+VT_Link = strcat("https://www.virustotal.com/gui/ip-address/", RemoteIP)
 
-// 8) Keep only high/high-critical items to focus analyst attention (tunable)
-| where RiskLevel in ("HIGH","CRITICAL")
-
-// 9) MITRE mapping and analyst links
-| extend
-    MITRE_Tactics = "TA0011: Command and Control",
-    MITRE_Techniques = case(
-        RemotePort == 1080, "T1090: Proxy",
-        RemotePort == 1194, "T1573: Encrypted Channel",
-        "T1071: Application Layer Protocol"
-    ),
-    VT_Link = strcat("https://www.virustotal.com/gui/ip-address/", RemoteIP)
-
-// 10) Build actionable hunting directives (pack_array produces an array)
+// ---- Hunter Directives ----
 | extend HuntingDirectives = pack_array(
-    strcat("1. Verify legitimacy of process: ", SampleProcess),
-    strcat("2. Inspect command line for anomalies: ", SampleCommand),
-    strcat("3. Review ", tostring(Count), " suspicious connections to ", RemoteIP),
-    strcat("4. Check VirusTotal reputation: ", VT_Link),
-    strcat("5. Port usage context: ", metadata_comment),
-    "6. Correlate with DeviceProcessEvents for parent-child process tree",
-    "7. Check DeviceLogonEvents to identify the user session",
-    "8. Isolate endpoint if risk is confirmed and collect memory dump"
-  )
+    strcat("1) Investigate executable using port: ", SampleProcess),
+    strcat("2) Parent process: ", SampleParent),
+    strcat("3) Command line: ", SampleCommand),
+    strcat("4) SHA256: ", SampleHash, " | Signer: ", SampleSigner),
+    strcat("5) Review ", tostring(Count), " connections to ", RemoteIP),
+    strcat("6) Port context: ", metadata_comment),
+    strcat("7) VirusTotal IP check: ", VT_Link),
+    "8) Pivot into DeviceProcessEvents for full process tree",
+    "9) Review logon context and isolate if malicious"
+)
 
-// 11) Final projection for UI / workbook
+// ---- Final Output (your exact projection) ----
 | project
     FirstSeen, LastSeen, DeviceName, RemoteIP, RemotePort, Count,
-    RiskLevel, PortContext = metadata_comment, Confidence = metadata_confidence,
-    SampleProcess, SampleCommand, MITRE_Tactics, MITRE_Techniques, VT_Link, HuntingDirectives
+    RiskLevel,
+    PortContext = metadata_comment,
+    Confidence = metadata_confidence,
+    SampleProcess, SampleCommand,
+    MITRE_Tactics, MITRE_Techniques, VT_Link, HuntingDirectives
 
 | order by RiskLevel desc, Count desc, FirstSeen desc
