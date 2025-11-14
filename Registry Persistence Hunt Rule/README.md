@@ -140,53 +140,7 @@ While supply-chain infections begin elsewhere (trojanised updates, compromised v
 | `MITRE_Tactics`, `MITRE_Techniques` | ATT&CK mapping |
 | `HuntingDirectives` | SOC-ready guidance for response |
 
----
-
-## 📁 Suggested Folder Structure (GitHub)
-
-Create a dedicated folder in your repo, for example:
-
-```
-/Registry-Persistence-Detection
-    ├── registry_persistence_hunt.kql
-    ├── README.md
-    ├── samples/
-    └── references/
-```
-
----
-
-## 📌 How to Create the Folder in GitHub
-
-**Option A – in the GitHub Web UI**
-
-1. Go to your repository.  
-2. Click **“Add file” → “Create new file”**.  
-3. In the filename box, type:  
-   `Registry-Persistence-Detection/README.md`  
-4. Paste this README content.  
-5. Commit the file.  
-6. To add the rule, create another file:  
-   `Registry-Persistence-Detection/registry_persistence_hunt.kql`  
-   and paste the KQL query.
-
-**Option B – using Git locally**
-
-```bash
-mkdir Registry-Persistence-Detection
-cd Registry-Persistence-Detection
-
-# Create files
-echo "" > README.md
-echo "" > registry_persistence_hunt.kql
-
-# Then open & paste content, then:
-git add .
-git commit -m "Add registry persistence detection rule and README"
-git push
-```
-
----
+----
 
 ## 🔗 Pairing Suggestions
 
