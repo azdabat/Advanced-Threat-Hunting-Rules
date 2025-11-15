@@ -1,0 +1,48 @@
+// ============================================================================
+// Suspicious Certificates with Zero KeySize or Missing Signature Algorithm
+// Detects malformed, corrupted, or attacker-injected certificates.
+// Author: Ala Dabat (Alstrum)
+// MITRE: T1553.002 (Subvert Trust Controls), T1547.006 (Driver Load Persistence),
+//        T1484 (Domain Trust Abuse), T1562.001 (Defense Evasion)
+// ============================================================================
+
+let DeviceInformation = DeviceInfo
+    | project DeviceId, DeviceName;
+
+DeviceInformation
+| join kind=inner (
+    DeviceTvmCertificateInfo
+    | where KeySize == "0" or SignatureAlgorithm == ""
+    | extend TO = parse_json(IssuedTo),
+             BY = parse_json(IssuedBy)
+    | extend 
+        TOCN = tostring(TO.CommonName),
+        TOORG = tostring(TO.Organization),
+        TOCountry = tostring(TO.CountryName),
+        BYCN = tostring(BY.CommonName),
+        BYORG = tostring(BY.Organization),
+        BYCountry = tostring(BY.CountryName)
+    | project DeviceId, Thumbprint, 
+              TOCN, TOORG, TOCountry,
+              BYCN, BYORG, BYCountry,
+              KeySize, SignatureAlgorithm
+) on DeviceId
+| extend RiskScore = case(
+      KeySize == "0" and SignatureAlgorithm == "", 10,
+      KeySize == "0", 9,
+      SignatureAlgorithm == "", 8,
+      5
+)
+| extend HunterDirective = case(
+      RiskScore == 10, "CRITICAL: Certificate structure is invalid (no key + no signature). Investigate immediately for driver tampering, rootkit activity, or trust chain manipulation.",
+      RiskScore >= 9, "HIGH: Certificate has zero key size. Check for BYOVD, malicious drivers, or corrupted certificate stores.",
+      RiskScore >= 8, "MEDIUM-HIGH: Missing signature algorithm. Check for certificate store corruption or privilege escalation.",
+      "Review certificate issuer/subject for abnormal entries or corruption."
+)
+| extend MITRE = dynamic(["T1553.002", "T1562.001", "T1547.006"])
+| project DeviceId, DeviceName, Thumbprint,
+          KeySize, SignatureAlgorithm,
+          TOCN, TOORG, TOCountry,
+          BYCN, BYORG, BYCountry,
+          RiskScore, HunterDirective, MITRE
+| order by RiskScore desc;
