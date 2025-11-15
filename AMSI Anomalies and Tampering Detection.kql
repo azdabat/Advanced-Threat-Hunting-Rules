@@ -1,0 +1,41 @@
+// =============================================================================
+// AMSI Anomalies and Tampering Detection
+// Author: Ala Dabat
+// Purpose: Detect AMSI bypass attempts and anti-malware scan interface tampering
+// Hunter Directive: Investigate AMSI failures and tampering for potential malware evasion
+// =============================================================================
+
+let Lookback = 7d;
+
+DeviceEvents
+| where Timestamp >= ago(Lookback)
+| where ActionType has "Amsi" or AdditionalFields has_cs "AMSI"
+| extend 
+    AmsiEventType = case(
+        ActionType == "AmsiScan", "AMSI Scan",
+        ActionType == "AmsiBlocked", "AMSI Blocked",
+        ActionType == "AmsiException", "AMSI Exception", 
+        ActionType == "AmsiTamper", "AMSI Tampering",
+        "Other AMSI Event"
+    ),
+    ProcessName = tostring(parse_json(AdditionalFields).ProcessName),
+    ScanResult = tostring(parse_json(AdditionalFields).ScanResult),
+    IsSuspicious = ScanResult != "Clean" or AmsiEventType == "AmsiTamper" or AmsiEventType == "AmsiException"
+| where IsSuspicious
+| extend HunterDirective = strcat(
+    "INVESTIGATE: AMSI anomaly detected - ", AmsiEventType, 
+    " from process: ", ProcessName,
+    " with result: ", ScanResult,
+    ". Review process execution chain and check for encoded scripts or fileless techniques. ",
+    "Correlate with PowerShell events and script block logging."
+)
+| project 
+    Timestamp,
+    DeviceName,
+    AmsiEventType,
+    ProcessName,
+    ScanResult,
+    AdditionalFields,
+    HunterDirective,
+    RuleName = "AMSI Anomalies and Tampering Detection"
+| order by Timestamp desc;
