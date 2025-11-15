@@ -1,0 +1,47 @@
+// =============================================================================
+// LSASS Access Patterns from Unusual Processes
+// Author:Ala Dabat
+// Purpose: Detect credential dumping via LSASS memory access
+// Hunter Directive: Investigate LSASS access for potential credential theft
+// =============================================================================
+
+let Lookback = 7d;
+let CommonLsassTools = dynamic(["procdump.exe", "ProcDump", "dumpit.exe", "Mimikatz", "lsass.dmp", "SQLDumper.exe", "Out-Minidump.ps1"]);
+let SuspiciousParents = dynamic(["rundll32.exe", "regsvr32.exe", "mshta.exe", "wscript.exe", "cscript.exe", "powershell.exe", "pwsh.exe"]);
+
+DeviceEvents
+| where Timestamp >= ago(Lookback)
+| where ActionType == "ProcessAccessed" 
+    or (AdditionalFields has_cs "lsass.exe" and ActionType != "ProcessCreated")
+| extend 
+    TargetProcess = tostring(parse_json(AdditionalFields).TargetProcess),
+    AccessingProcess = tostring(parse_json(AdditionalFields).InitiatingProcessFileName),
+    AccessingSHA1 = tostring(parse_json(AdditionalFields).InitiatingProcessSHA1)
+| where TargetProcess has_cs "lsass.exe" or AdditionalFields has_cs "lsass.exe"
+| where AccessingProcess !in~ ("msedge.exe", "chrome.exe", "firefox.exe", "explorer.exe")  // Common benign
+| extend 
+    IsSuspiciousParent = AccessingProcess in (SuspiciousParents),
+    IsKnownTool = AdditionalFields has_any (CommonLsassTools),
+    RiskLevel = case(
+        IsKnownTool, "CRITICAL",
+        IsSuspiciousParent, "HIGH", 
+        "MEDIUM"
+    )
+| extend HunterDirective = strcat(
+    RiskLevel, " PRIORITY: LSASS access detected from ", AccessingProcess, 
+    ". Parent: ", tostring(parse_json(AdditionalFields).InitiatingProcessParentFileName),
+    ". User: ", tostring(parse_json(AdditionalFields).InitiatingProcessAccountUpn),
+    ". Check for credential dumping tools and review for lateral movement indicators. ",
+    "Verify if this is legitimate administrative activity."
+)
+| project 
+    Timestamp,
+    DeviceName,
+    AccessingProcess,
+    AccessingSHA1,
+    TargetProcess,
+    AdditionalFields,
+    RiskLevel,
+    HunterDirective,
+    RuleName = "LSASS Access Patterns"
+| order by Timestamp desc;
