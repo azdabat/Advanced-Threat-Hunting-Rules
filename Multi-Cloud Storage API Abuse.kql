@@ -1,0 +1,182 @@
+// ============================================================================
+// Multi-Cloud Storage API Abuse from Non-Client Processes (Low Noise/CPU)
+// Services: Dropbox, Google Drive, OneDrive, Box, MEGA
+// Author: Ala Dabat (Alstrum) | Version: 2025-11
+// MITRE: T1071.001, T1567.002, T1090.001, T1027, T1036, T1573
+// ============================================================================
+
+let lookback = 14d;
+
+// Per-service domains (small, curated sets)
+let dropboxDomains = dynamic([
+  "api.dropboxapi.com",
+  "content.dropboxapi.com",
+  "notify.dropboxapi.com",
+  "www.dropbox.com",
+  "dl.dropboxusercontent.com"
+]);
+
+let gdriveDomains = dynamic([
+  "drive.google.com",
+  "docs.google.com",
+  "www.googleapis.com"
+]);
+
+let onedriveDomains = dynamic([
+  "onedrive.live.com",
+  "graph.microsoft.com",
+  "sharepoint.com",       // e.g. tenant.sharepoint.com
+  "sharepoint-df.com"
+]);
+
+let boxDomains = dynamic([
+  "api.box.com",
+  "box.com"
+]);
+
+let megaDomains = dynamic([
+  "mega.nz",
+  "api.mega.nz"
+]);
+
+let allowedBrowsers = dynamic(["chrome.exe","msedge.exe","firefox.exe","iexplore.exe"]);
+
+// ============================================================================
+// CORE SIGNAL – non-browser, non-client processes talking to cloud storage
+// ============================================================================
+
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort in (80, 443)
+| where isnotempty(RemoteUrl)
+| extend 
+    ProcessName = tolower(InitiatingProcessFileName),
+    FolderPath  = tolower(InitiatingProcessFolderPath),
+    ParentName  = tolower(InitiatingProcessParentFileName)
+| extend CloudService = case(
+    RemoteUrl has_any(dropboxDomains), "Dropbox",
+    RemoteUrl has_any(gdriveDomains),  "GoogleDrive",
+    RemoteUrl has_any(onedriveDomains), "OneDrive",
+    RemoteUrl has_any(megaDomains),    "MEGA",
+    RemoteUrl has_any(boxDomains),     "Box",
+    "Unknown"
+)
+| where CloudService != "Unknown"
+
+// Official sync clients / first-party agents
+| extend IsOfficialClient = case(
+    CloudService == "Dropbox"   and (ProcessName has "dropbox"   or FolderPath has "\\dropbox\\"),   true,
+    CloudService == "OneDrive"  and (ProcessName has "onedrive"  or FolderPath has "\\onedrive\\"),  true,
+    CloudService == "GoogleDrive" and (ProcessName has_any(dynamic(["googledrivesync.exe","google drive"])) 
+                                       or FolderPath has "\\google\\drive\\"),                      true,
+    CloudService == "Box"       and (ProcessName has "box"       or FolderPath has "\\box\\"),       true,
+    CloudService == "MEGA"      and (ProcessName has "mega"      or FolderPath has "\\mega\\"),      true,
+    false
+)
+| extend 
+    IsBrowser = ProcessName in (allowedBrowsers),
+    IsSystem  = ProcessName in~ ("svchost.exe","services.exe","system","lsass.exe","winlogon.exe"),
+    IsOffice  = ProcessName in~ ("winword.exe","excel.exe","outlook.exe","powerpnt.exe")
+
+// Low-noise constraints
+| where IsOfficialClient == false
+| where IsBrowser == false
+| where SentBytes > 500000 // > 500KB
+
+// ============================================================================
+// BEHAVIOURAL ENRICHMENT & SCORING
+// ============================================================================
+| extend 
+    SuspiciousParent = case(
+        ParentName in~ ("powershell.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe"), "Script Parent",
+        ParentName in~ ("rundll32.exe","regsvr32.exe","msiexec.exe"),                         "LOLBin Parent",
+        ParentName in~ ("svchost.exe","services.exe"),                                       "Unexpected System Parent",
+        "Other"
+    ),
+    DataVolumeIndicator = case(
+        SentBytes > 50*1024*1024, "Massive Upload (>50MB)",
+        SentBytes > 10*1024*1024, "Large Upload (>10MB)",
+        SentBytes >  1*1024*1024, "Medium Upload (>1MB)",
+        "Normal"
+    ),
+    RiskScore = 0
+        + iif(IsSystem, 9, 0)
+        + iif(SuspiciousParent == "LOLBin Parent", 7, 0)
+        + iif(SuspiciousParent == "Script Parent", 6, 0)
+        + iif(IsOffice, 5, 0)
+        + iif(DataVolumeIndicator == "Massive Upload (>50MB)", 6, 0)
+        + iif(DataVolumeIndicator == "Large Upload (>10MB)",   4, 0)
+        + iif(DataVolumeIndicator == "Medium Upload (>1MB)",   2, 0)
+
+// ============================================================================
+// DYNAMIC HUNTER DIRECTIVES (PER SERVICE)
+// ============================================================================
+| extend HunterDirective = case(
+
+    IsSystem == true,
+        "CRITICAL: System-level process (" + ProcessName + 
+        ") communicating with " + CloudService + 
+        ". Check for **process injection**, **token theft**, or **proxy abuse**. " +
+        "Dump memory, confirm signer, and pivot to other outbound channels.",
+
+    SuspiciousParent == "LOLBin Parent",
+        "HIGH: LOLBin parent → child process → " + CloudService + 
+        ". Investigate **fileless malware**, **living-off-the-land exfil** or **C2 over cloud**. " +
+        "Review the full process tree and recent script/installer activity.",
+
+    SuspiciousParent == "Script Parent",
+        "HIGH: Script-based " + CloudService + " communication. Inspect script (VBS/PS1/HTA) " +
+        "for **encoded payloads**, **hard-coded tokens**, or **bulk file loops**. " +
+        "Pivot to DeviceFileEvents for staging directories.",
+
+    DataVolumeIndicator == "Massive Upload (>50MB)",
+        "HIGH: Massive upload to " + CloudService + ". Potential **bulk data exfiltration**. " +
+        "Identify file paths, user, and time window. Engage data owners.",
+
+    DataVolumeIndicator == "Large Upload (>10MB)",
+        "MEDIUM: Large data transfer to " + CloudService + 
+        ". Confirm if this aligns with a legitimate business workflow.",
+
+    IsOffice == true,
+        "MEDIUM: Office process using " + CloudService + 
+        ". Possible **macro or add-in driven exfil**. Review macros/templates and recent documents.",
+
+    "LOW: Unusual " + CloudService + " access from " + ProcessName + 
+    ". Validate user intent and whitelisting requirements."
+)
+
+// ============================================================================
+// THREAT SCENARIOS
+// ============================================================================
+| extend PotentialThreatScenarios = case(
+    IsSystem, "Process Injection → System Process → Cloud Exfiltration (" + CloudService + ")",
+    SuspiciousParent == "LOLBin Parent", "Fileless C2 or exfil via LOLBins → " + CloudService,
+    SuspiciousParent == "Script Parent", "Script-based data theft or C2 via " + CloudService,
+    DataVolumeIndicator startswith "Massive", "Large-scale data exfiltration to " + CloudService,
+    DataVolumeIndicator startswith "Large", "Steady or bursty data exfiltration to " + CloudService,
+    IsOffice, "Macro or plugin exfil to " + CloudService,
+    "General cloud storage abuse (" + CloudService + ")"
+)
+
+// ============================================================================
+// OUTPUT
+// ============================================================================
+| project 
+    Timestamp,
+    DeviceName,
+    CloudService,
+    ProcessName,
+    ProcessFolderPath = InitiatingProcessFolderPath,
+    ParentProcess = InitiatingProcessParentFileName,
+    RemoteUrl,
+    RemotePort,
+    SentBytes,
+    ReceivedBytes,
+    SuspiciousParent,
+    DataVolumeIndicator,
+    RiskScore,
+    PotentialThreatScenarios,
+    HunterDirective,
+    MITRETechniques = dynamic(["T1071.001","T1567.002","T1027","T1036","T1573"]),
+    RuleName = "Multi-Cloud Storage API Abuse (Non-Client Processes)"
+| order by RiskScore desc, Timestamp desc;
