@@ -1,0 +1,51 @@
+// =============================================================================
+// Rare Driver Prevalence in Tenant Environment
+// Author:Ala Dabat
+// Purpose: Identify rarely seen drivers across the environment
+// Hunter Directive: Investigate drivers with low prevalence for potential rootkits
+// =============================================================================
+
+let BaselinePeriod = 30d;
+let CurrentPeriod = 2d;
+let RareThreshold = 3;
+
+// Baseline - drivers seen in last 30 days (excluding last 2 days)
+let BaselineDrivers =
+    DeviceEvents
+    | where Timestamp between (ago(BaselinePeriod) .. ago(CurrentPeriod))
+    | where ActionType == "DriverLoad"
+    | summarize BaselineDeviceCount = dcount(DeviceId) by FileName, SHA1 = tostring(parse_json(AdditionalFields).SHA1);
+
+// Current period drivers
+let CurrentDrivers =
+    DeviceEvents
+    | where Timestamp >= ago(CurrentPeriod)
+    | where ActionType == "DriverLoad"
+    | summarize CurrentDevices = make_set(DeviceId) by FileName, SHA1 = tostring(parse_json(AdditionalFields).SHA1;
+
+// Find rare or new drivers
+CurrentDrivers
+| join kind=leftouter BaselineDrivers on FileName
+| extend 
+    BaselineDeviceCount = coalesce(BaselineDeviceCount, 0),
+    CurrentDeviceCount = array_length(CurrentDevices),
+    IsRareInBaseline = BaselineDeviceCount <= RareThreshold,
+    IsNewInEnvironment = BaselineDeviceCount == 0
+| where IsRareInBaseline or IsNewInEnvironment
+| extend HunterDirective = strcat(
+    "INVESTIGATE: Rare driver detected - ", FileName, 
+    ". Seen on ", tostring(CurrentDeviceCount), " device(s) in last 2 days, but only ", 
+    tostring(BaselineDeviceCount), " in previous 30 days. ",
+    "Check driver signing, review load events, and verify legitimacy. ",
+    "Potential rootkit or persistence mechanism."
+)
+| project 
+    FileName,
+    SHA1,
+    CurrentDeviceCount,
+    BaselineDeviceCount,
+    IsNewInEnvironment,
+    IsRareInBaseline,
+    HunterDirective,
+    RuleName = "Rare Driver Prevalence in Tenant"
+| order by CurrentDeviceCount desc, IsNewInEnvironment desc;
