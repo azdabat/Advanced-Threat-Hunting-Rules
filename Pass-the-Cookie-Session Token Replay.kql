@@ -1,0 +1,101 @@
+// ======================================================================
+// Pass-the-Cookie / OAuth Refresh Token Replay – L3 Native Detection
+// Author: Ala Dabat (Alstrum)
+// MITRE: T1539 (Steal Web Session Cookie), T1550.004 (Web Session Hijacking)
+// ======================================================================
+
+let lookback = 14d;
+
+// ------------------------------------
+// 1. Suspicious browser processes
+// ------------------------------------
+let Browsers = dynamic(["chrome.exe","msedge.exe","firefox.exe","brave.exe"]);
+
+let BrowserProc =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in (Browsers)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine, ProcessId;
+
+// ------------------------------------
+// 2. Browser token / cookie DB access
+// ------------------------------------
+let CookieStores = dynamic([
+    "Login Data","Cookies","Network\\Cookies","Web Data",
+    "Local State","History","Signon.db"
+]);
+
+let CookieAccess =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FileName has_any (CookieStores)
+| where ActionType in ("FileModified","FileCopied","FileDeleted")
+| project Timestamp, DeviceName, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, FileName, FolderPath;
+
+// ------------------------------------
+// 3. Suspicious processes touching cookie stores
+// ------------------------------------
+let SuspiciousReaders =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName !in (Browsers)   // Should not be touching cookie DBs
+| where ProcessCommandLine has_any ("cookie","token","session","oauth","refresh")
+      or FileName has_any (".py",".exe",".bat",".dll")   // common exfil tools
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine, InitiatingProcessFileName;
+
+// ------------------------------------
+// 4. Correlate:
+//    - Non-browser touching cookie DBs
+//    - Token-related CMD attempts
+//    - File access to session stores
+// ------------------------------------
+CookieAccess
+| join kind=inner SuspiciousReaders on DeviceName
+| extend SuspiciousCookieAccess = 1
+
+// ------------------------------------
+// 5. Behaviour scoring
+// ------------------------------------
+| extend ConfidenceScore =
+    70
+    + iif(FileName1 has_any (CookieStores), 10, 0)
+    + iif(ProcessCommandLine has "token", 6, 0)
+    + iif(ProcessCommandLine has_any ("oauth","refresh","session"), 6, 0)
+    + iif(InitiatingProcessFileName in ("powershell.exe","cmd.exe","wscript.exe","python.exe"), 6, 0)
+    + iif(FileName1 endswith ".db", 4, 0)
+
+// ------------------------------------
+// 6. Severity
+// ------------------------------------
+| extend Severity = case(
+    ConfidenceScore >= 90, "High",
+    ConfidenceScore >= 80, "Medium",
+    "Low"
+)
+
+// ------------------------------------
+// 7. Hunter Directives
+// ------------------------------------
+| extend ThreatHunterDirectives = strcat(
+    "Severity=", Severity,
+    "; Device=", DeviceName,
+    "; CookieStore=", FileName1,
+    "; Proc=", FileName,
+    "; CMD=", ProcessCommandLine,
+    "; RecommendedNextSteps=",
+    case(
+        Severity == "High",
+            "Likely pass-the-cookie or session hijacking attempt. Immediately review process tree, isolate device, pull browser ART, and check token misuse in identity logs.",
+        Severity == "Medium",
+            "Check for non-browser access to cookie/session DBs. Investigate user behaviour and recent credential-access alerts.",
+        "Use for context. Validate automation or benign scripts."
+    )
+)
+
+// ------------------------------------
+// 8. Final output
+// ------------------------------------
+| order by ConfidenceScore desc
