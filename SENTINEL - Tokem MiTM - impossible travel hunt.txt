@@ -1,6 +1,116 @@
+// ======================================================================
+// AzureAD Token MiTM / Token Replay / Impossible Travel – L3 Detection
+// Author: Ala Dabat 
+// Behaviour: Token stolen and reused from another IP/device
+// ======================================================================
+
+let lookback = 7d;
+
+// Known high-risk IP patterns (tune for your environment)
+let CloudIPs = dynamic(["amazonaws.com","azure.com","googleusercontent.com","digitalocean.com"]);
+
+// ---------------------------------------------
+// 1. Successful logins with useful token metadata
+// ---------------------------------------------
+let Logins =
 SigninLogs
-| where TokenIssuerType == "AzureAD"
-| where ResultType == 0  // Success
-| where ClientAppUsed !in ("Browser","Mobile App")
-| summarize count() by UserPrincipalName, IPAddress, AppDisplayName
-| where count_ > 1 and dcount(IPAddress) > 1
+| where TimeGenerated >= ago(lookback)
+| where ResultType == 0   // Successful login
+| extend
+    UPN = UserPrincipalName,
+    IP = IPAddress,
+    App = AppDisplayName,
+    Device = tostring(DeviceDetail.deviceId),
+    OS = tostring(DeviceDetail.operatingSystem),
+    Browser = tostring(DeviceDetail.browser),
+    ClientApp = ClientAppUsed,
+    Tenant = ResourceTenantId,
+    Location = strcat(LocationDetails.city, ", ", LocationDetails.country),
+    AS = tostring(AutonomousSystemNumber),
+    ISP = tostring(ServiceProvider),
+    Risk = RiskDetail
+| project TimeGenerated, UPN, IP, App, Device, OS, Browser, ClientApp, Location, ISP, AS, Tenant;
+
+// ---------------------------------------------
+// 2. Cluster per user (token replay patterns)
+// ---------------------------------------------
+let Cluster =
+Logins
+| summarize
+    FirstSeen=min(TimeGenerated),
+    LastSeen=max(TimeGenerated),
+    Count=count(),
+    UniqueIPs=dcount(IP),
+    UniqueDevices=dcount(Device),
+    UniqueOS=dcount(OS),
+    UniqueClientApps=dcount(ClientApp),
+    IPList=make_set(IP,20),
+    DeviceList=make_set(Device,20),
+    OSList=make_set(OS,20),
+    ClientList=make_set(ClientApp,20)
+  by UPN;
+
+// ---------------------------------------------
+// 3. Impossible travel and MiTM indicators
+// ---------------------------------------------
+let Suspicious =
+Logins
+| join kind=inner Cluster on UPN
+| extend
+    // Token replay: same token generation window, different geo/IP/OS/device
+    ImpossibleTravel = iif(UniqueIPs >= 2 and UniqueDevices >= 2, 1, 0),
+    TokenReplay = iif(UniqueIPs >= 2 and UniqueClientApps >= 2, 1, 0),
+    DeviceMismatch = iif(UniqueDevices >= 2 and UniqueOS >= 2, 1, 0),
+
+    // Cloud exit-node usage (proxy/VPN/MiTM infra)
+    SuspiciousISP = iif(ISP has_any (CloudIPs), 1, 0),
+
+    // Non-browser → common in token replay
+    NonBrowserAccess = iif(ClientAppUsed !in ("Browser","Mobile App"), 1, 0)
+;
+
+// ---------------------------------------------
+// 4. Behaviour Scoring
+// ---------------------------------------------
+let Scored =
+Suspicious
+| extend ConfidenceScore =
+    0
+    + iif(ImpossibleTravel == 1, 40, 0)
+    + iif(TokenReplay == 1,      30, 0)
+    + iif(DeviceMismatch == 1,   20, 0)
+    + iif(NonBrowserAccess == 1, 15, 0)
+    + iif(SuspiciousISP == 1,    10, 0)
+| extend Severity = case(
+    ConfidenceScore >= 60, "High",
+    ConfidenceScore >= 40, "Medium",
+    ConfidenceScore >= 20, "Low",
+    "Informational"
+);
+
+// ---------------------------------------------
+// 5. Final Output
+// ---------------------------------------------
+Scored
+| where ConfidenceScore >= 40   // MEDIUM+ by default
+| project
+    TimeGenerated,
+    UPN,
+    Severity,
+    ConfidenceScore,
+    IP,
+    Location,
+    ISP,
+    Device,
+    OS,
+    Browser,
+    ClientApp,
+    ImpossibleTravel,
+    TokenReplay,
+    DeviceMismatch,
+    SuspiciousISP,
+    NonBrowserAccess,
+    IPList,
+    DeviceList,
+    ClientList
+| order by ConfidenceScore desc, TimeGenerated desc
