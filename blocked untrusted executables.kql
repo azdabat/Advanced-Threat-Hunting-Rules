@@ -1,0 +1,23 @@
+//blocked untrusted executables
+// Author: Cyb3rMonk(https://twitter.com/Cyb3rMonk, https://mergene.medium.com)
+//
+// Query parameters:
+DeviceEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("AsrUntrustedExecutableAudited","AsrUntrustedExecutableBlocked")
+| summarize arg_min(Timestamp,*), LocalPrevalence = dcount(DeviceId) by SHA1, FileName
+| where Timestamp > ago(1d)
+| where LocalPrevalence <= 5
+// there might be files without signature info, perform leftouter join
+| join kind=leftouter (
+    DeviceFileCertificateInfo
+    | where Timestamp > ago(30d)
+    | summarize arg_max(Timestamp,*) by SHA1
+    )
+    on SHA1
+// Get GlobalPrevalence info, etc.
+| invoke FileProfile(SHA1, 1000)
+// GlobalFirstSeen can be used for filtering the results further
+// If you want to list only the files that have invalid signatures uncomment the below line
+// there might be files without signature info, don't exclude them
+// | where IsTrusted <> 1
