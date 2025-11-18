@@ -1,0 +1,23 @@
+//ISO creation in strange directories
+//Author: Ala Dabat
+let Threshold = 100;
+DeviceFileEvents
+// Extract the FileExtentsion from the filename
+| extend FileExtension = tostring(extract(@'.*\.(.*)', 1, FileName))
+// Filter only on ISO files
+| where FileExtension =~ 'iso'
+| where ActionType != 'FileRenamed'
+| where isnotempty(SHA1)
+// Enrich file information
+| invoke FileProfile("SHA1", 10000)
+// Depending on your hunting activities you can alter the threshold for 
+| where GlobalPrevalence <= Threshold
+| project
+     DeviceName,
+     ActionType,
+     GlobalPrevalence,
+     GlobalFirstSeen,
+     FolderPath,
+     SHA1,
+     FileOriginUrl
+| sort by GlobalPrevalence, SHA1
