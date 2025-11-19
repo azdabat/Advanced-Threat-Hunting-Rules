@@ -1,82 +1,104 @@
-/* 
-===============================================================
-Rule Name: First-Time Inbound Remote Access & VPN/RMM Detection
+/*  
+=====================================================================
+Rule: First-Time or Rare Inbound Remote Access
 Author: Ala Dabat
-Version: 1.0
-Description:
-  Identifies first-time inbound connections across all devices,
-  highlighting new VPN endpoints, RMM tools, admin-port access,
-  unknown geolocations and hosting providers.  
-  Designed for high-fidelity threat hunting in MDE/Sentinel.
-===============================================================
+Purpose:
+  Detect new or unusually rare inbound activity:
+   - First-time VPN, RDP, SSH, SMB inbound
+   - First-time RMM activity (AnyDesk, ScreenConnect, RustDesk…)
+   - Bad ASN / hosting provider sources
+   - New country or unusual geolocation
+   - Rare activity (≤3 occurrences in 30 days)
+Mapped MITRE:
+  T1133, T1021.*, T1090, T1105
+=====================================================================
 */
 
-//////////////////// CONFIG ////////////////////
-let lookback = 30d;
-let recent = 1d;
-let allowedIPs = dynamic(["1.1.1.1","2.2.2.2"]);
-let allowedCountries = dynamic(["GB","UK"]);
-let vpnPorts = dynamic([500,4500,1701,1194,51820]);
-let rmmNames = dynamic(["screenconnect","anydesk","kaseya","splashtop","rustdesk","zerotier","supremo","teamviewer"]);
-let adminPorts = dynamic([3389,22,445]);
-let badProviders = dynamic(["ovh","hetzner","contabo","m247","digitalocean","linode","proton","nord"]);
+//// CONFIG ////
+let LookbackDays = 30d;
+let RecentWindow = 1d;
+let LowFrequencyThreshold = 3;
+let AllowedCountries = dynamic(["GB","UK"]);
+let AllowedIPs = dynamic(["1.1.1.1"]);
+let VpnPorts = dynamic([500,4500,1701,1194,51820]);
+let AdminPorts = dynamic([3389,22,445]);    // RDP, SSH, SMB
+let RmmIndicators = dynamic(["anydesk","screenconnect","rustdesk","supremo","teamviewer","splashtop","kaseya"]);
+let BadASNList = dynamic(["ovh","hetzner","contabo","m247","digitalocean","linode","proton","nord"]);
 
-//////////////////// BASELINE ////////////////////
-let base =
+//// BASELINE – 30 DAYS ////
+let HistoricalInbound =
 DeviceNetworkEvents
-| where Timestamp between (ago(lookback) .. ago(recent))
+| where Timestamp between (ago(LookbackDays) .. ago(RecentWindow))
 | where ActionType == "InboundConnectionAccepted"
-| project DeviceId, BaselineIP = RemoteIP;
+| summarize PrevCount = count() by DeviceId, RemoteIP;
 
-//////////////////// RECENT INBOUND ////////////////////
-let recentInbound =
+//// RECENT – 24 HOURS ////
+let CurrentInbound =
 DeviceNetworkEvents
-| where Timestamp >= ago(recent)
+| where Timestamp >= ago(RecentWindow)
 | where ActionType == "InboundConnectionAccepted"
-| project Timestamp, DeviceId, DeviceName, LocalPort, RemoteIP, RemoteUrl,
-         InitiatingProcessFileName, InitiatingProcessCommandLine;
+| project Timestamp, DeviceId, DeviceName, RemoteIP, LocalPort,
+          ProcName = InitiatingProcessFileName,
+          ProcCmd = InitiatingProcessCommandLine,
+          RemoteUrl;
 
-//////////////////// FIRST-TIME ONLY ////////////////////
-recentInbound
-| join kind=leftanti base on DeviceId, RemoteIP == BaselineIP
+//// MERGE BASELINE ////
+CurrentInbound
+| join kind=leftouter HistoricalInbound on DeviceId, RemoteIP
+| extend FirstTimeSeen = PrevCount == 0 or PrevCount == "",
+         LowFrequency = PrevCount > 0 and PrevCount <= LowFrequencyThreshold
 
-//////////////////// ENRICHMENT ////////////////////
+//// DEVICE CONTEXT ////
 | join kind=leftouter (
-    DeviceInfo 
+    DeviceInfo
     | summarize arg_max(Timestamp, *) by DeviceId
-    | project DeviceId, OSPlatform, ExposureLevel, OnboardingStatus
+    | project DeviceId, DeviceName, OSPlatform, ExposureLevel
+) on DeviceId
+
+//// GEO + ISP CONTEXT ////
+| join kind=leftouter (
+    DeviceNetworkInfo
+    | summarize arg_max(Timestamp, *) by DeviceId
+    | project DeviceId, GeoCountry, ISP
 ) on DeviceId
 | extend Country = tostring(GeoCountry),
-         ISP = tostring(AdditionalFields.remoteProvider),
-         fname = tolower(InitiatingProcessFileName),
-         url_l = tolower(RemoteUrl),
-         isp_l = tolower(ISP)
+         ASN = tolower(tostring(ISP)),
+         UrlLower = tolower(RemoteUrl),
+         ProcLower = tolower(ProcName)
 
-//////////////////// CLASSIFICATION ////////////////////
-| extend IsVPN = iif(LocalPort in (vpnPorts), 1, 0),
-         IsRMM = iif(fname has_any (rmmNames) or url_l has_any (rmmNames), 1, 0),
-         IsAdminPort = iif(LocalPort in (adminPorts), 1, 0),
-         IsBadProvider = iif(isp_l has_any (badProviders), 1, 0),
-         IsNewCountry = iif(Country !in (allowedCountries) and isnotempty(Country), 1, 0)
+//// CLASSIFIERS (Clear Naming) ////
+| extend IsVPNPort = iif(LocalPort in (VpnPorts), 1, 0),
+         IsAdminAccess = iif(LocalPort in (AdminPorts), 1, 0),
+         IsRMMAccess = iif(ProcLower has_any (RmmIndicators) or UrlLower has_any (RmmIndicators), 1, 0),
+         IsBadASN = iif(ASN has_any (BadASNList), 1, 0),
+         IsNewCountry = iif(Country !in (AllowedCountries) and isnotempty(Country), 1, 0),
+         IsUnapprovedIP = iif(RemoteIP !in (AllowedIPs), 1, 0);
 
-//////////////////// SCORING ////////////////////
+//// SCORING (Human-Reasoned) ////
 | extend Score =
-      iif(IsAdminPort == 1, 30, 0)
-    + iif(IsVPN == 1, 20, 0)
-    + iif(IsRMM == 1, 25, 0)
-    + iif(IsBadProvider == 1, 20, 0)
-    + iif(IsNewCountry == 1, 25, 0)
-    + iif(RemoteIP !in (allowedIPs), 10, 0)
+        iif(IsAdminAccess == 1, 30, 0) +
+        iif(IsVPNPort == 1, 20, 0) +
+        iif(IsRMMAccess == 1, 25, 0) +
+        iif(IsBadASN == 1, 20, 0) +
+        iif(IsNewCountry == 1, 25, 0) +
+        iif(FirstTimeSeen, 20, 0) +
+        iif(LowFrequency, 10, 0) +
+        iif(IsUnapprovedIP == 1, 10, 0) +
+        iif(ExposureLevel == "High", 15, 0);
 
-//////////////////// DIRECTIVES ////////////////////
-| extend HunterDirectives = case(
-    Score >= 70, "CRITICAL: First-time inbound from high-risk source. Validate if expected, review process lineage & parallel access. If unapproved: isolate immediately.",
-    Score between (40 .. 69), "HIGH: New inbound remote access pattern. Confirm user/device context; pivot DeviceTimeline ±1h; check RDP/SSH/SMB follow-on.",
-    "MEDIUM: First-time inbound from unfamiliar IP. Baseline host behaviour and monitor for escalation."
+//// HUNTER DIRECTIVES (Human-Readable) ////
+| extend HunterNotes = case(
+      Score >= 70,
+        "CRITICAL: First-time or rare inbound access from high-risk ASN/country or RMM/VPN. Investigate DeviceTimeline ±2 hours, check parallel sessions, confirm if authorised. If unknown: isolate.",
+      Score between (40 .. 69),
+        "HIGH: New or low-frequency inbound connection. Validate whether expected. Pivot into process tree and related identity activity.",
+      "MEDIUM: New inbound IP for this host. Build baseline and monitor for expansion."
 )
 
-//////////////////// OUTPUT ////////////////////
-| project Timestamp, DeviceName, DeviceId, RemoteIP, RemoteUrl, LocalPort, Country, ISP,
-          ExposureLevel, InitiatingProcessFileName, InitiatingProcessCommandLine,
-          IsVPN, IsRMM, IsAdminPort, IsBadProvider, IsNewCountry, Score, HunterDirectives
+//// OUTPUT ////
+| project Timestamp, DeviceName, DeviceId, RemoteIP, LocalPort, Country, ASN,
+          ProcName, ProcCmd,
+          FirstTimeSeen, LowFrequency,
+          IsVPNPort, IsAdminAccess, IsRMMAccess, IsBadASN, IsNewCountry,
+          Score, HunterNotes
 | order by Score desc, Timestamp desc
