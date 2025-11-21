@@ -255,8 +255,57 @@ This is a mature, reproducible, production-minded rulepack suitable for use in:
 
 ---
 
-# End of README
++--------------------------------------------------------------------------------------------+
+|                                   MITRE ATT&CK HEATMAP                                      |
+|                     Coverage: AMSI/LOLBins Evaders + C2 Port/Jitter Detectors              |
++-----------------------+-------------------------------+-------------------------------+-----+
+|        TACTIC         |         TECHNIQUE ID          |          TECHNIQUE NAME       | HIT |
++-----------------------+-------------------------------+-------------------------------+-----+
+| Initial Access        | T1189                         | Drive-by Compromise           |     |
+|                       | T1190                         | Exploit Public-Facing App     |     |
++-----------------------+-------------------------------+-------------------------------+-----+
+| Execution             | T1059.001                     | PowerShell                    | AMSI|
+|                       | T1218                         | Signed Binary Proxy Execution | LOLB|
+|                       | T1047                         | WMI Execution                 | LOLB|
++-----------------------+-------------------------------+-------------------------------+-----+
+| Persistence           | T1547                         | Boot/Logon Autostart Exec     | LOLB|
+|                       | T1543.003                     | Create/Modify Windows Service | C2  |
++-----------------------+-------------------------------+-------------------------------+-----+
+| Privilege Escalation  | T1055                         | Process Injection             | AMSI|
+|                       | T1548                         | Abuse Elevation Control       |     |
++-----------------------+-------------------------------+-------------------------------+-----+
+| Defense Evasion       | T1562.001                     | Disable Security Tools        | AMSI|
+|                       | T1562.004                     | Disable/Modify Sys Config     | AMSI|
+|                       | T1112                         | Modify Registry               | LOLB|
+|                       | T1027                         | Obfuscated/Encoded Commands   | AMSI|
+|                       | T1089                         | Disabling Security Products   | AMSI|
++-----------------------+-------------------------------+-------------------------------+-----+
+| Credential Access     | T1003.001                     | LSASS Memory Dumping          | AMSI|
+|                       | T1558.003                     | Kerberos Attacks              |     |
++-----------------------+-------------------------------+-------------------------------+-----+
+| Discovery             | T1083                         | File and Dir Discovery        |     |
+|                       | T1012                         | Registry Query                |     |
++-----------------------+-------------------------------+-------------------------------+-----+
+| Lateral Movement      | T1047                         | WMI                           | LOLB|
+|                       | T1021.006                     | WinRM (5985/5986)             | C2  |
++-----------------------+-------------------------------+-------------------------------+-----+
+| Collection            | T1056                         | Input Capture                 |     |
++-----------------------+-------------------------------+-------------------------------+-----+
+| Command & Control     | T1071                         | Application Layer Protocol    | C2  |
+|                       | T1573                         | Encrypted Channel             | C2  |
+|                       | T1090                         | Proxy / Tunneling             | C2  |
+|                       | T1008                         | Fallback Channels             | C2J |
+|                       | T1105                         | Ingress Tool Transfer         | C2  |
++-----------------------+-------------------------------+-------------------------------+-----+
+| Exfiltration          | T1041                         | Exfil Over C2 Channel         | C2J |
+|                       | T1020                         | Automated Exfiltration        | C2J |
++-----------------------+-------------------------------+-------------------------------+-----+
+| Impact                | T1489                         | Service Stop                  | AMSI|
++-----------------------+-------------------------------+-------------------------------+-----+
 
+AMSI  = Detected by AMSI/LOLBins Defense Evasion Rule
+LOLB  = Detected via LOLBin behaviour (rundll32, regsvr32, mshta, wmic, certutil, bitsadmin)
+C2    = Detected via Suspicious Ports (Static)
+C2J   = Detected via Hybrid Jitter C2 Detector
 
-# Recommended Layout in Repository
 
