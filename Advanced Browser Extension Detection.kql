@@ -1,0 +1,118 @@
+// =====================================================================================================
+// NATIVE THREAT HUNT — Browser Extension Abuse (Chrome/Edge)
+// Author: Ala Dabat
+// Purpose:
+//     Hunter-focused collection of ALL browser-extension installation artifacts
+//     + live MISP threat-intel matching (extension IDs, CRX hashes, URLs)
+//     + process context, registry context, file context
+//
+//     This is NOT an engineering detection rule.
+//     This is a raw threat hunting surface.
+//     Every installation is visible. No filtering. No summarisation.
+//     Use this to pivot into C2, exfil, cookie theft, session hijacking, and MITRE T1176 investigations.
+// -----------------------------------------------------------------------------------------------------
+// MISP TI Integration:
+//   - Assumes extension IDs ingested as observable type "browser-extension-id"
+//   - Table: ThreatIntelligenceIndicator OR custom "MISP_Indicators_CL"
+//   - Matching logic: ExtensionID (32 chars) OR SHA256 of CRX file OR supporting URLs
+// -----------------------------------------------------------------------------------------------------
+// Guidance:
+//   1) Look for rare ExtensionID values (dcount wash across devices)
+//   2) Look for high-risk loaders (powershell/mshta/wscript/rundll32/curl)
+//   3) Look for policy-based installs (registry Forcelist keys)
+//   4) Look for extension folder creation followed by a manifest write
+//   5) Pivot: find web traffic related to extension servers
+//   6) Look for credentials/session artifact access afterwards
+//
+// This is the full raw hunting query, with all context preserved.
+// =====================================================================================================
+
+
+// --------------------------- MISP Threat Intelligence -------------------------------------------------
+let MISP_Extensions =
+ThreatIntelligenceIndicator
+| where isnotempty(IndicatorId)
+| where Active == true
+| where Description has_any ("extension","browser","chrome","edge")
+       or ThreatType has_any ("malicious-extension","browser-extension")
+       or IndicatorType == "browser-extension-id"
+| extend MISP_ExtensionID = tolower(IndicatorValue)
+| where MISP_ExtensionID matches regex @"^[a-z]{32}$"
+| project MISP_ExtensionID, ThreatType, Description, SourceSystem, Tags, ConfidenceScore, IndicatorId;
+
+
+// --------------------------- Extension artifacts (CRX + Folders + Manifest + Policy) ------------------
+
+// CRX installer writes
+let CRX_Artifacts =
+DeviceFileEvents
+| where Timestamp >= ago(14d)
+| where ActionType == "FileCreated"
+| where FileName endswith ".crx"
+| extend ExtensionID = tolower(extract(@"([a-z]{32})",1,FileName))
+| where isnotempty(ExtensionID)
+| extend ArtifactType = "CRX_Installer";
+
+// Folder creation
+let Folder_Artifacts =
+DeviceFileEvents
+| where Timestamp >= ago(14d)
+| where FolderPath has @"\User Data\" and FolderPath has @"\Extensions\"
+| where ActionType in ("FileCreated","FolderCreated")
+| extend ExtensionID = tolower(extract(@"\\Extensions\\([a-z]{32})\\",1,FolderPath))
+| where isnotempty(ExtensionID)
+| extend ArtifactType = "ExtensionFolder";
+
+// Manifest.json writes
+let Manifest_Artifacts =
+DeviceFileEvents
+| where Timestamp >= ago(14d)
+| where FileName =~ "manifest.json"
+| where FolderPath has @"\User Data\" and FolderPath has @"\Extensions\"
+| extend ExtensionID = tolower(extract(@"\\Extensions\\([a-z]{32})\\",1,FolderPath))
+| where isnotempty(ExtensionID)
+| extend ArtifactType = "ManifestWrite";
+
+// Policy Forcelist (enterprise persistence)
+let Policy_Artifacts =
+DeviceRegistryEvents
+| where Timestamp >= ago(14d)
+| where RegistryKey startswith @"HKEY_LOCAL_MACHINE\SOFTWARE\Policies\"
+| where RegistryKey has "ExtensionInstallForcelist"
+| extend ExtensionID = tolower(extract(@"([a-z]{32})",1, tostring(RegistryValueData)))
+| where isnotempty(ExtensionID)
+| extend ArtifactType = "PolicyForceInstall";
+
+
+// --------------------------- Raw union ---------------------------------------------------------
+let RawExtensionEvents =
+union CRX_Artifacts, Folder_Artifacts, Manifest_Artifacts, Policy_Artifacts;
+
+
+// --------------------------- Join full context ---------------------------------------------------
+RawExtensionEvents
+| extend InstallingProcess = InitiatingProcessFileName,
+         InstallingCommand = InitiatingProcessCommandLine
+| join kind=leftouter (
+    DeviceInfo
+    | project DeviceId, DeviceName, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags
+) on DeviceId
+| join kind=leftouter MISP_Extensions on ExtensionID == MISP_ExtensionID
+
+// --------------------------- Output for threat hunters (raw rows) -------------------------------
+| extend WebStore_Chrome = strcat("https://chrome.google.com/webstore/detail/", ExtensionID),
+         WebStore_Edge   = strcat("https://microsoftedge.microsoft.com/addons/detail/", ExtensionID),
+         CRXcavator      = strcat("https://crxcavator.io/report/", ExtensionID),
+         TotalRiskTags   = tostring(Tags)
+| project Timestamp,
+         DeviceName, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags,
+         ArtifactType,
+         ExtensionID,
+         FileName, FolderPath, RegistryKey, RegistryValueData,
+         FileSHA256 = SHA256,
+         InstallingProcess, InstallingCommand,
+         MISP_Hit = isnotempty(MISP_ExtensionID),
+         MISP_ExtensionID,
+         ThreatType, Description, SourceSystem, ConfidenceScore,
+         WebStore_Chrome, WebStore_Edge, CRXcavator
+| order by Timestamp desc
