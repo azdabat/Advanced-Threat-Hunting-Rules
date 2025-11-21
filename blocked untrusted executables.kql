@@ -1,6 +1,5 @@
 //blocked untrusted executables
-// Author: Cyb3rMonk(https://twitter.com/Cyb3rMonk, https://mergene.medium.com)
-//
+// Ala Dabat
 // Query parameters:
 DeviceEvents
 | where Timestamp > ago(30d)
