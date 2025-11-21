@@ -1,0 +1,56 @@
+// =====================================================================================================
+// Browser Extension Hunt — Low CPU Native Hunt 
+// Author: Ala Dabat
+// Description:
+//   Raw surface for threat hunters. Surfaces any extension installation artifact
+//   (CRX, folder create, manifest write, forced policy install).
+//   No TI, no rarity, minimal joins, no summarise. Clean and fast.
+// -----------------------------------------------------------------------------------------------------
+// CPU Notes:
+//   - Very low CPU: no environment-wide dcount, no scoring, no rarity evaluation.
+//   - DeviceInfo join is lightweight.
+//   - No summarise unless hunter adds one manually.
+//   - Suitable for large tenants. Returns raw events for pivoting.
+// =====================================================================================================
+
+let lookback = 7d;
+
+let CRX_Events =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FileName endswith ".crx" and ActionType == "FileCreated"
+| extend ExtensionID = tolower(extract(@"([a-z]{32})",1,FileName))
+| where isnotempty(ExtensionID)
+| extend InstallMethod="CRXInstaller";
+
+let Folder_Events =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FolderCreated")
+| where FolderPath has @"\User Data\" and FolderPath has @"\Extensions\"
+| extend ExtensionID = tolower(extract(@"\\Extensions\\([a-z]{32})\\",1,FolderPath))
+| where isnotempty(ExtensionID)
+| extend InstallMethod="ExtensionFolder";
+
+let Manifest_Events =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FileName =~ "manifest.json" and FolderPath has @"\Extensions\"
+| extend ExtensionID = tolower(extract(@"\\Extensions\\([a-z]{32})\\",1,FolderPath))
+| where isnotempty(ExtensionID)
+| extend InstallMethod="ManifestWrite";
+
+let Policy_Events =
+DeviceRegistryEvents
+| where Timestamp >= ago(lookback)
+| where RegistryKey has "ExtensionInstallForcelist"
+| extend ExtensionID = tolower(extract(@"([a-z]{32})",1,tostring(RegistryValueData)))
+| where isnotempty(ExtensionID)
+| extend InstallMethod="PolicyForceInstall";
+
+union CRX_Events, Folder_Events, Manifest_Events, Policy_Events
+| join kind=leftouter (DeviceInfo | project DeviceId, DeviceName, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags) on DeviceId
+| extend InstallingProcessName    = InitiatingProcessFileName,
+         InstallingProcessCommand = InitiatingProcessCommandLine
+| project Timestamp,DeviceName,OSPlatform,DeviceCategory,ExposureLevel,DeviceTags,InstallMethod,ExtensionID,FileName,FolderPath,RegistryKey,RegistryValueData,InstallingProcessName,InstallingProcessCommand,SHA256
+| order by Timestamp desc
