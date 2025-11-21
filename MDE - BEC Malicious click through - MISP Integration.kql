@@ -20,24 +20,24 @@ EmailEvents
 
 let lookback = 7d;
 
-// 1️⃣ Pull delivered emails in the last 'lookback' period
+// 1️ Pull delivered emails in the last 'lookback' period
 let DeliveredEmails = EmailEvents
 | where TimeGenerated >= ago(lookback)
 | where DeliveryAction == "Delivered"
 | project TimeGenerated, NetworkMessageId, RecipientEmailAddress, SenderFromAddress, Subject, AttachmentCount, DeliveryAction;
 
-// 2️⃣ Pull URL click events (user clicked links)
+// 2️ Pull URL click events (user clicked links)
 let UrlClicks = UrlClickEvents
 | where TimeGenerated >= ago(lookback)
 | where ActionType in ("ClickAllowed","ClickBlocked")  // detect both allowed and blocked clicks
 | project ClickTime=TimeGenerated, NetworkMessageId, RecipientEmailAddress, Url, ActionType;
 
-// 3️⃣ Combine email delivery with URL clicks
+// 3️ Combine email delivery with URL clicks
 let EmailClickThrough = DeliveredEmails
 | join kind=inner (UrlClicks) on NetworkMessageId, RecipientEmailAddress
 | project ClickTime, RecipientEmailAddress, SenderFromAddress, Subject, Url, ActionType, AttachmentCount, DeliveryAction;
 
-// 4️⃣ Enrich with MISP threat intelligence
+// 4️ Enrich with MISP threat intelligence
 let EmailClickEnriched = EmailClickThrough
 | join kind=leftouter (
     ThreatIntelligenceIndicator
@@ -47,7 +47,7 @@ let EmailClickEnriched = EmailClickThrough
 | extend TotalScore = coalesce(TI_Score,0)
 | order by TotalScore desc, ClickTime desc;
 
-// 5️⃣ Final output
+// 5️ Final output
 EmailClickEnriched
 | project ClickTime, RecipientEmailAddress, SenderFromAddress, Subject, Url, ActionType, AttachmentCount, DeliveryAction, TotalScore
 
@@ -62,24 +62,24 @@ EmailClickEnriched
 
 let lookback = 7d;
 
-// 1️⃣ Delivered emails
+// 1️ Delivered emails
 let DeliveredEmails = EmailEvents
 | where TimeGenerated >= ago(lookback)
 | where DeliveryAction == "Delivered"
 | project TimeGenerated, NetworkMessageId, RecipientEmailAddress, SenderFromAddress, Subject, AttachmentCount, DeliveryAction;
 
-// 2️⃣ URL clicks
+// 2️ URL clicks
 let UrlClicks = UrlClickEvents
 | where TimeGenerated >= ago(lookback)
 | where ActionType in ("ClickAllowed","ClickBlocked")
 | project ClickTime=TimeGenerated, NetworkMessageId, RecipientEmailAddress, Url, ActionType;
 
-// 3️⃣ Join emails & clicks
+// 3️ Join emails & clicks
 let EmailClickThrough = DeliveredEmails
 | join kind=inner (UrlClicks) on NetworkMessageId, RecipientEmailAddress
 | project ClickTime, RecipientEmailAddress, SenderFromAddress, Subject, Url, ActionType, AttachmentCount, DeliveryAction;
 
-// 4️⃣ MISP enrichment with dynamic scoring
+// 4️ MISP enrichment with dynamic scoring
 let EmailClickEnriched = EmailClickThrough
 | join kind=leftouter (
     ThreatIntelligenceIndicator
@@ -94,7 +94,7 @@ let EmailClickEnriched = EmailClickThrough
 ) on $left.Url == $right.TI_Indicator or $left.SenderFromAddress == $right.TI_Indicator
 | extend TotalScore = coalesce(TI_Score,0);
 
-// 5️⃣ Generate Threat Hunter Directives based on TotalScore and ActionType
+// 5️ Generate Threat Hunter Directives based on TotalScore and ActionType
 EmailClickEnriched
 | extend ThreatHunterDirective = case(
     TotalScore >= 80 and ActionType == "ClickAllowed", "Immediate review & containment: Isolate device, reset user account, block URL & sender, check endpoint telemetry",
@@ -116,24 +116,24 @@ EmailClickEnriched
 
 let lookback = 7d;
 
-// 1️⃣ Delivered emails
+// 1️ Delivered emails
 let DeliveredEmails = EmailEvents
 | where TimeGenerated >= ago(lookback)
 | where DeliveryAction == "Delivered"
 | project TimeGenerated, NetworkMessageId, RecipientEmailAddress, SenderFromAddress, Subject, AttachmentCount, DeliveryAction;
 
-// 2️⃣ URL clicks
+// 2️ URL clicks
 let UrlClicks = UrlClickEvents
 | where TimeGenerated >= ago(lookback)
 | where ActionType in ("ClickAllowed","ClickBlocked")
 | project ClickTime=TimeGenerated, NetworkMessageId, RecipientEmailAddress, Url, ActionType;
 
-// 3️⃣ Join emails & clicks
+// 3️ Join emails & clicks
 let EmailClickThrough = DeliveredEmails
 | join kind=inner (UrlClicks) on NetworkMessageId, RecipientEmailAddress
 | project ClickTime, RecipientEmailAddress, SenderFromAddress, Subject, Url, ActionType, AttachmentCount, DeliveryAction;
 
-// 4️⃣ MISP enrichment with dynamic scoring and ThreatType
+// 4️ MISP enrichment with dynamic scoring and ThreatType
 let EmailClickEnriched = EmailClickThrough
 | join kind=leftouter (
     ThreatIntelligenceIndicator
@@ -149,7 +149,7 @@ let EmailClickEnriched = EmailClickThrough
 | extend TotalScore = coalesce(TI_Score,0),
          ThreatType = coalesce(ThreatType,"Unknown");
 
-// 5️⃣ Generate Threat Hunter Directives based on TotalScore, ActionType, and ThreatType
+// 5️ Generate Threat Hunter Directives based on TotalScore, ActionType, and ThreatType
 EmailClickEnriched
 | extend ThreatHunterDirective = case(
     TotalScore >= 80 and ActionType == "ClickAllowed", strcat("Immediate review & containment: Isolate device, reset user account, block URL & sender, check endpoint telemetry [ThreatType: ", ThreatType, "]"),
@@ -161,4 +161,5 @@ EmailClickEnriched
 )
 | project ClickTime, RecipientEmailAddress, SenderFromAddress, Subject, Url, ActionType, AttachmentCount, DeliveryAction, TotalScore, ThreatType, ThreatHunterDirective
 | order by TotalScore desc, ClickTime desc
+
 
