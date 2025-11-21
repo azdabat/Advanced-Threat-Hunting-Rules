@@ -1,0 +1,102 @@
+// ============================================================================
+// Rule Name: HTTPS C2 Jitter Beacon Hunt (Low CPU)
+// Author: Ala Dabat
+// Purpose:
+//   Hunt for outbound HTTPS connections from endpoints that:
+//     - Talk repeatedly to the same IP/host over 443
+//     - Have small request sizes
+//     - Show semi-regular intervals with light jitter (typical C2 beacons)
+// Data Sources: DeviceNetworkEvents, DeviceInfo
+// MITRE: TA0011 Command and Control, TA0005 Defense Evasion
+// CPU Notes:
+//   - Lookback: 24h
+//   - One summarize per DeviceId/RemoteIP/RemotePort
+//   - No external joins except DeviceInfo
+//   - Expected impact: low/medium in large tenants, safe for scheduled runs
+// ============================================================================
+
+let lookback = 24h;
+let min_connections = 20;  // only look at fairly chatty pairs
+let max_payload_bytes = 50000; // exclude bulk transfers
+
+// Stage 1: Collect outbound HTTPS flows with small payloads
+let NetworkFlows =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort == 443
+| where Protocol == "Tcp"
+| where isnotempty(RemoteIP)
+| where InitiatingProcessFileName !in~ ("chrome.exe","msedge.exe","firefox.exe","teams.exe") // ignore noisy browsers by default
+| project Timestamp, DeviceId, DeviceName, RemoteIP, RemotePort,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessParentFileName, ReportId, LocalIP, LocalPort,
+          SentBytes, ReceivedBytes;
+
+// Stage 2: Basic filtering – focus on smaller, beacon-like payloads
+NetworkFlows
+| extend TotalBytes = tolong(SentBytes) + tolong(ReceivedBytes)
+| where TotalBytes <= max_payload_bytes
+// Stage 3: Compute inter-arrival stats per Device + RemoteIP + Process
+| sort by DeviceId, RemoteIP, InitiatingProcessFileName, Timestamp asc
+| extend PrevTimestamp = prev(Timestamp, 1, Timestamp),
+         IntervalSeconds = toreal(datetime_diff("second", Timestamp, PrevTimestamp))
+| where IntervalSeconds > 0
+| summarize
+    ConnectionCount        = count(),
+    AvgIntervalSeconds     = avg(IntervalSeconds),
+    MinIntervalSeconds     = min(IntervalSeconds),
+    MaxIntervalSeconds     = max(IntervalSeconds),
+    IntervalStdDevSeconds  = stdev(IntervalSeconds),
+    AvgBytesPerConnection  = avg(TotalBytes),
+    SampleProcessName      = any(InitiatingProcessFileName),
+    SampleProcessCommand   = any(InitiatingProcessCommandLine),
+    SampleParentProcess    = any(InitiatingProcessParentFileName),
+    FirstSeen              = min(Timestamp),
+    LastSeen               = max(Timestamp)
+  by DeviceId, DeviceName, RemoteIP, RemotePort
+// Stage 4: Heuristic for jittered beaconing:
+//   - Enough connections
+//   - Reasonably stable but not perfectly fixed interval
+//   - Not too bursty (Max/Min interval not insane)
+| where ConnectionCount >= min_connections
+| extend
+    IntervalSpread = MaxIntervalSeconds - MinIntervalSeconds
+| where AvgIntervalSeconds between (30 .. 900)  // between 30s and 15min beacons
+| where IntervalStdDevSeconds between (5 .. 600) // some jitter but not total chaos
+| where IntervalSpread > 30
+// Device enrichment
+| join kind=leftouter (
+    DeviceInfo
+    | project DeviceId, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags
+) on DeviceId
+// Confidence scoring
+| extend
+    ConfidenceScore = 50
+        + iif(SampleProcessName !in~ ("svchost.exe","services.exe","wininit.exe"), 15, 0)
+        + iif(ExposureLevel =~ "High", 10, 0)
+        + iif(DeviceCategory =~ "Server", 10, 0)
+| extend
+    Severity = case(
+        ConfidenceScore >= 80, "HIGH",
+        ConfidenceScore >= 60, "MEDIUM",
+        "LOW"
+    ),
+    MITRE_Tactics    = "TA0011 Command and Control, TA0005 Defense Evasion",
+    MITRE_Techniques = "T1071.001 Web Protocols, T1090 Proxy"
+// Hunter directives
+| extend HuntingDirectives = pack_array(
+    strcat("1) Review beaconing from device '", DeviceName, "' to ", RemoteIP, " over 443."),
+    strcat("2) Validate process: ", SampleProcessName, " | CmdLine: ", SampleProcessCommand),
+    strcat("3) Check parent: ", SampleParentProcess, " for initial launcher or implant."),
+    "4) Pivot: correlate with any alerts and process tree around FirstSeen/LastSeen.",
+    "5) Inspect TLS cert / JA3 / SNI in network telemetry if available.",
+    "6) If suspicious, block egress to the RemoteIP/hostname and capture full packet logs."
+)
+// Final projection
+| project FirstSeen, LastSeen, ConnectionCount, Severity, ConfidenceScore,
+          DeviceName, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags,
+          RemoteIP, RemotePort,
+          AvgIntervalSeconds, IntervalStdDevSeconds, AvgBytesPerConnection,
+          SampleProcessName, SampleProcessCommand, SampleParentProcess,
+          MITRE_Tactics, MITRE_Techniques, HuntingDirectives
+| order by Severity desc, ConnectionCount desc
