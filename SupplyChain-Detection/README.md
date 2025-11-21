@@ -1,115 +1,109 @@
-# 🧬 Supply-Chain & Sideloading / Driver Abuse Detection (KQL)
+# Supply-Chain & Sideloading / Driver Abuse Detection (KQL)
 
-This rule detects **post-compromise behaviours** associated with major supply-chain and component hijacking attacks such as:
+This rule targets post-compromise behaviours frequently observed in large-scale supply-chain and component hijacking attacks, including:
 
-- **3CX DesktopApp** compromise (malicious DLL sideloading)
-- **F5 BIG-IP** backdoor (malicious driver + DLL loader)
-- **SolarWinds SUNBURST** (staged, dormant DLL backdoor)
-- **NotPetya / M.E.Doc**-style loader behaviour
+- 3CX DesktopApp compromise (malicious DLL sideloading)
+- F5 BIG-IP backdoor activity (malicious drivers and loaders)
+- SolarWinds SUNBURST staged DLL backdoor behaviour
+- NotPetya / M.E.Doc-style loader execution
 
-It focuses on:
+Focus areas include:
 
-- Malicious **DLL drops** in abused directories
-- **Fast-load DLL execution** (sideloading)
-- **Dormant DLL / driver staging**
-- **Unsigned/invalid drivers** (BYOVD)
-- **Registry persistence** referencing executables/scripts
-- **Remote payload downloads** for DLLs, drivers and loaders
-- **Threat Intelligence enrichment** (MISP / TI table)
+- Malicious DLL drops in abused directories
+- Fast-load DLL execution (sideloading indicators)
+- Dormant DLL and driver staging
+- Unsigned or invalid driver loads (BYOVD patterns)
+- Registry-based execution and persistence
+- Remote payload downloads (.dll/.sys/.exe/.bin/.dat)
+- Optional threat-intel enrichment (MISP / ThreatIntelligenceIndicator)
 
 ---
 
-## 🧩 What This Rule Detects
+## What This Rule Detects
 
 ### Behavioural Surfaces
 
-| Stage                         | Behaviour / Surface                                  | Detected? |
-|-------------------------------|------------------------------------------------------|-----------|
-| Malicious DLL drop            | `.dll` in ProgramData/Users/Temp/Tasks               | ✔         |
-| Fast-load DLL execution       | DLL loaded < 5 min after drop                        | ✔✔        |
-| DLL loaded into high-trust app| 3CX / SolarWinds / Outlook / Teams                   | ✔✔        |
-| Dormant DLL                   | DLL in writable path >7d, no load                    | ✔         |
-| Driver drop                   | `.sys` in writable or abused locations               | ✔✔        |
-| Dormant driver                | `.sys` dropped but never loaded >7d                  | ✔✔        |
-| Unsigned / bad-signed load    | DLL/driver with invalid/unknown signature            | ✔✔        |
-| Registry execution/persistence| Run keys / services / script paths in Registry       | ✔✔        |
-| Payload download              | URLs with `.dll/.sys/.exe/.bin/.dat`                 | ✔✔        |
-| TI-correlated artefacts       | Hash/IP/URL/Domain matches in ThreatIntelligence     | ✔✔        |
+Stage | Behaviour / Surface | Detected
+------|----------------------|---------
+Malicious DLL drop | .dll written to ProgramData/Users/Temp/Tasks | Yes
+Fast-load DLL execution | DLL loaded within 5 minutes after drop | High
+DLL loaded into trusted apps | 3CX, SolarWinds binaries, Outlook, Teams | High
+Dormant DLL | DLL in writable path older than 7 days, never loaded | Yes
+Driver drop | .sys in writable or abused directories | High
+Dormant driver | .sys dropped but not loaded for >7 days | High
+Unsigned or invalid signature | DLL/driver with unknown or invalid signer | High
+Registry execution | Run keys, services, or script paths referencing payloads | High
+Payload download | URLs delivering .dll/.sys/.exe/.bin/.dat | High
+TI-correlated artefacts | Hash/IP/URL/domain appearing in TI feeds | High
 
 ---
 
-## 🎯 Supply-Chain Attack Coverage
+## Supply-Chain Attack Coverage
 
-| Attack                     | DLL Drop | DLL Fast-Load | Dormant DLL | Driver Abuse | Registry Persistence | Network Payloads | Notes |
-|----------------------------|----------|---------------|-------------|-------------|----------------------|------------------|-------|
-| **3CX DesktopApp**         | ✔        | ✔✔            | ❌          | ❌          | ✔ (variants)         | ✔                | Malicious DLL sideloaded into 3CX app |
-| **F5 BIG-IP 2025**         | ✔        | ✔             | ✔           | ✔✔          | ✔✔                   | ✔                | Dormant driver + DLL loader + services |
-| **SolarWinds SUNBURST**    | ✔        | ✔             | ✔✔          | ❌          | ✔                    | ✔                | Staged DLL backdoor active after delay |
-| **NotPetya (M.E.Doc)**     | ✔        | ✔             | ❌          | ❌          | ✔                    | ✔                | DLL loader prior to disk wiping         |
-| **Generic Vendor Compromise** | ✔     | ✔             | ✔           | ✔           | ✔                    | ✔                | Behaviour-first detection, IOC-free     |
-
----
-
-## 🚦 ThreatHunterDirective & HuntingDirectives
-
-The rule emits two key fields for SOC analysts:
-
-### `ThreatHunterDirective`
-A **single, context-aware triage line**, e.g.:
-
-- `CRITICAL: Likely DLL sideloading supply-chain compromise (3CX/SolarWinds-style)...`
-- `CRITICAL: Suspicious driver activity consistent with BYOVD/F5-style compromise...`
-- `HIGH: Dormant DLL in writable path; potential staged loader (SolarWinds-style)...`
-- `MEDIUM: Remote download of executable component...`
-
-This makes the rule **SOC-friendly** and ready for alerting or incident queues.
-
-### `HuntingDirectives`
-An **array of step-by-step actions** for human hunters:
-
-1. Confirm if DLL/driver is expected for the vendor/application.
-2. Check process lineage and verify installer/update legitimacy.
-3. For DLL sideloading, inspect the parent process (e.g. 3CX / SolarWinds) and validate the binary’s integrity.
-4. For drivers, review signing, origin of install, and linked services.
-5. Pivot to network events for C2 or staging infra around drop/load times.
-6. If compromise suspected, isolate endpoint and feed IOCs into MISP/TI.
-7. Hunt for the same hash/filename/persistence pattern across all endpoints.
+Attack | DLL Drop | Fast-Load | Dormant DLL | Driver Abuse | Registry Persistence | Network Payloads | Notes
+-------|----------|-----------|-------------|--------------|----------------------|------------------|-------
+3CX DesktopApp | Yes | High | No | No | Yes (variants) | Yes | Malicious DLL sideloading into the 3CX binary directory
+F5 BIG-IP 2025 | Yes | Yes | Yes | High | High | Yes | Driver + DLL loader chain with service persistence
+SolarWinds SUNBURST | Yes | Yes | High | No | Yes | Yes | Staged dormant DLL backdoor with delayed activation
+NotPetya (M.E.Doc) | Yes | Yes | No | No | Yes | Yes | Loader preceding destructive payload
+Generic Vendor Compromise | Yes | Yes | Yes | Yes | Yes | Yes | Behaviour-driven, IOC-independent detection
 
 ---
 
-## 🧠 MITRE ATT&CK Mapping
+## ThreatHunterDirective and HuntingDirectives
 
-| Tactic            | Techniques                                                     |
-|-------------------|----------------------------------------------------------------|
-| **TA0003 – Persistence**      | T1547.001 (Registry Run Keys), T1543.003 (Services), T1195 (Supply Chain) |
-| **TA0004 – Privilege Escalation** | T1543.003 (Driver/Service), T1574.001 (DLL hijack)          |
-| **TA0005 – Defense Evasion**  | T1574.001 (Sideloading), T1036 (Masquerading)                   |
-| **TA0006 – Credential Access**| Dependent on follow-on modules (e.g., LSASS access, not in this rule) |
-| **TA0011 – C2**               | T1105 (Ingress Tool Transfer)                                   |
-| **TA0010 – Exfiltration**     | T1041/T1020 when combined with C2 detection                     |
+### ThreatHunterDirective
+A single high-context triage line produced by the rule, examples:
 
-This rule is **post-compromise & behaviour-first**, not IOC-centric, but it **can be boosted with MISP / TI** via the `ThreatIntelligenceIndicator` table.
+- CRITICAL: Likely DLL sideloading consistent with 3CX or SolarWinds-style supply-chain compromise  
+- CRITICAL: Potential BYOVD scenario with suspicious driver load patterns  
+- HIGH: Dormant DLL in writable directory suggesting staged loader behaviour  
+- MEDIUM: Remote retrieval of binary component likely linked to loader activity  
+
+### HuntingDirectives
+Multi-step analyst guidance emitted per detection:
+
+1. Validate whether the DLL or driver is expected for the application or vendor.  
+2. Inspect process lineage and confirm the legitimacy of installation/update activity.  
+3. For DLL sideloading, examine the parent process (3CX, SolarWinds Orion, etc.) and confirm binary integrity.  
+4. For driver writes, review signing, install origin, and associated services.  
+5. Correlate drop/load time with network telemetry for C2 or staging infrastructure.  
+6. If compromise is indicated, isolate the host and enrich findings with MISP or threat-intel feeds.  
+7. Hunt across all endpoints for matching hashes, filenames, or persistence patterns.
 
 ---
 
-## 🛠 How To Use
+## MITRE ATT&CK Mapping
 
-1. **Paste** `MDE_SupplyChain_Sideloading_DriverAbuse.kql` into **Advanced Hunting**.
-2. Adjust:
+Tactic | Techniques
+-------|-----------
+Persistence | T1547.001 (Run Keys), T1543.003 (Services), T1195 (Supply-Chain Compromise)
+Privilege Escalation | T1543.003 (Driver/Service), T1574.001 (DLL Hijacking)
+Defense Evasion | T1574.001 (Sideloading), T1036 (Masquerading)
+Credential Access | Dependent on downstream modules (LSASS/SSP, not part of this rule)
+Command and Control | T1105 (Ingress Tool Transfer)
+Exfiltration | T1041/T1020 when combined with C2-oriented detections
+
+This rule is behaviour-first, post-compromise focused, and can be augmented with MISP or other TI sources.
+
+---
+
+## How To Use
+
+1. Paste `MDE_SupplyChain_Sideloading_DriverAbuse.kql` into Advanced Hunting.  
+2. Adjust tunables:  
    - `lookback` (default: 14d)  
    - `dormant_window` (default: 7d)  
-   - `confidence_threshold` (default: 3)
-3. Seed `known_malicious_hashes` with:
-   - Supply-chain IOCs from **MISP**
-   - Hashes from your threat feeds
-4. Optionally wire into:
+   - `confidence_threshold` (default: 3)  
+3. Populate `known_malicious_hashes` with current supply-chain IOCs from MISP or other threat-intel feeds.  
+4. Integrate with:  
    - Custom detection rule  
-   - Sentinel Analytics Rule (via Defender → Sentinel connector)  
-   - SOAR playbook using `ThreatHunterDirective` as summary text
+   - Sentinel analytics via the Defender → Sentinel connector  
+   - SOAR automation using `ThreatHunterDirective` as the summary message  
 
 ---
 
-## 📂 Suggested Repo Layout
+## Suggested Repo Layout
 
 ```text
 SupplyChain-Detection/
