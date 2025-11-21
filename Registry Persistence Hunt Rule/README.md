@@ -1,154 +1,149 @@
-# 🧬 Registry Persistence & Hijack Detection (MDE / Sentinel)
+# Registry Persistence & Hijack Detection (MDE / Sentinel)
 
-**Author:** Ala Dabat  
-**Detection Type:** Endpoint Persistence Hunt (Registry)  
-**Tactics:**  
-- TA0003 – Persistence  
-- TA0002 – Execution  
-- TA0005 – Defense Evasion  
+Author: Ala Dabat  
+Detection Type: Endpoint Persistence Hunt (Registry)  
+Tactics: TA0003 | TA0002 | TA0005
 
 ---
 
-## 🎯 Purpose
+## Purpose
 
-This detection hunts for **high-risk registry-based persistence** and **hijack mechanisms**, focusing on:
+This detection focuses on high-risk registry persistence and hijack techniques that attackers use for long-term access and execution. It targets the specific registry paths most commonly abused in real intrusions, with attention to payload content, initiation process, signer, and prevalence.
 
-- Run / RunOnce keys  
-- Winlogon (Userinit / Shell)  
-- AppInit_DLLs  
+Coverage includes:
+
+- Run and RunOnce keys  
+- Winlogon Shell and Userinit hijacks  
+- AppInit_DLLs global DLL injection  
 - Services-based persistence  
-- IFEO (Image File Execution Options) injection  
+- IFEO (Image File Execution Options) debugger redirection  
 - COM hijacking (CLSID + InprocServer32)  
-- LSA / SSP credential theft hooks  
-- User-writable paths and LOLBin-staged payloads  
+- LSA/SSP credential provider persistence  
+- User-writable paths and LOLBin-driven payloads  
 
-It’s tuned for **L3 threat hunting** and designed to surface **true persistence** rather than noise from normal software installs.
-
----
-
-## 🧠 What This Rule Will Detect
-
-| Category | Detected? | Description |
-|----------|-----------|-------------|
-| Registry Run / RunOnce persistence | 🟩 Yes | Malware or tools set to start at logon |
-| Winlogon Shell/Userinit hijacks | 🟩 Yes | Alternate shells, custom userinit executables |
-| AppInit_DLLs abuse | 🟩 Yes | Global DLL injection into processes |
-| Services-based persistence | 🟩 Yes | New or modified `Services` entries |
-| IFEO injection | 🟩 Yes | Debugger redirection (mimikatz-style tricks) |
-| COM hijacking (CLSID/InprocServer32) | 🟩 Yes | COM objects pointed to attacker DLLs |
-| LSA/SSP credential theft hooks | 🟩 Yes | Malicious SSP DLLs for credential theft |
-| LOLBin-backed registry payloads | 🟩 Yes | `rundll32`, `regsvr32`, `mshta`, `powershell` etc. |
-| Base64/encoded payloads in values | 🟩 Yes | Staged scripts / commands in registry |
-| Rare unsigned binaries as persistence | 🟩 Yes | Uses prevalence & signer logic |
+The rule is tuned for L3 threat hunting and aims to surface actual persistence rather than routine software writes.
 
 ---
 
-## ❌ What This Rule Will *Not* Detect
+## What This Rule Detects
 
-| Missed Category | Reason |
-|-----------------|--------|
-| WMI Event Consumers | No `WMIEvent` / `Win32_*` surface used here |
-| Scheduled Tasks persistence | Needs `DeviceProcessEvents` + TaskCache / XML hunt |
-| Startup folder shortcuts | File-system based, not registry |
-| Kernel / driver persistence | Requires driver telemetry, ELAM/ETW providers |
-| GPO-based persistence | GPO registry.pol / SYSVOL writes, not endpoint-written |
-| Fileless-only, fully in-memory malware | No registry footprint to detect |
-
-Pair this rule with your **DLL/driver sideloading** and **scheduled tasks** hunts for full coverage.
-
----
-
-## 🧩 MITRE ATT&CK Mapping
-
-| Tactic | Technique | Description |
-|--------|-----------|-------------|
-| TA0003 – Persistence | T1547.001 | Registry Run Keys / Startup Folder |
-| TA0003 – Persistence | T1547.009 | LSA / SSP credential providers |
-| TA0003 – Persistence | T1543.003 | Windows Service persistence |
-| TA0003 – Persistence | T1546.012 | IFEO injection |
-| TA0003 – Persistence | T1546.015 | COM Hijacking |
-| TA0002 – Execution | T1059.001 | PowerShell execution via registry |
-| TA0002 – Execution | T1218.010/011/005 | LOLBins: regsvr32, rundll32, mshta |
-| TA0005 – Defense Evasion | T1105 | Payload download / staging from registry config |
+Category | Detected | Description
+---------|----------|------------
+Registry Run / RunOnce persistence | Yes | Malware or tooling set to launch at user logon
+Winlogon Shell/Userinit hijacks | Yes | Alternate shells or custom executables invoked at login
+AppInit_DLLs | Yes | Global DLL injection into GUI processes
+Services-based persistence | Yes | New or modified service entries
+IFEO injection | Yes | Debugger redirection to attacker binaries
+COM hijacking | Yes | CLSID and InprocServer32 pointing to malicious DLLs
+LSA/SSP hooks | Yes | Credential-stealing SSP DLLs
+LOLBin-backed payloads | Yes | rundll32, regsvr32, mshta, powershell, wscript, cscript, etc.
+Encoded payloads | Yes | Base64 or encoded scripts in registry values
+Rare unsigned binaries | Yes | Uses prevalence and signer analysis to identify anomalies
 
 ---
 
-## 🧪 Detection Logic Summary
+## What This Rule Does Not Detect
 
-The rule stacks multiple **independent signals**:
+Category | Reason
+---------|--------
+WMI Event Consumers | Requires WMI provider telemetry
+Scheduled Task persistence | Needs TaskCache and DeviceProcessEvents
+Startup folder shortcuts | File-system based, not registry
+Kernel or driver persistence | Depends on ELAM/driver telemetry
+GPO-based persistence | Registry.pol and SYSVOL not covered here
+Fully in-memory or fileless malware | No registry footprint present
 
-- **Key Scope:** Only known persistence / hijack keys in HKLM/HKCU  
-- **Payload Content:**  
-  - Encoded Command / Base64  
-  - URLs / IP addresses / domains  
-  - Executable/script extensions (`.exe`, `.dll`, `.ps1`, `.vbs`, `.js`, etc.)  
-- **Abnormal Initiator:** Unsigned or rare processes writing these keys  
-- **Signer & Publisher:** Non-trusted or unknown publisher modifies persistence keys  
-- **Prevalence:** Rare binaries (≤ 2 devices) weighted more heavily  
+Pair this with DLL/driver sideloading and task-based persistence hunts for full coverage.
 
-It then aggregates per **Device + RegistryKey + ValueName** and returns:
+---
 
-- Signal count  
-- Severity  
-- Who wrote the value  
-- Example command line  
+## MITRE ATT&CK Mapping
+
+Tactic | Technique | Notes
+-------|-----------|------
+Persistence | T1547.001 | Registry Run keys
+Persistence | T1547.009 | LSA/SSP credential providers
+Persistence | T1543.003 | Windows service persistence
+Persistence | T1546.012 | IFEO debugger hijacking
+Persistence | T1546.015 | COM hijacking
+Execution | T1059.001 | PowerShell via registry entries
+Execution | T1218.010/011/005 | LOLBins: regsvr32, rundll32, mshta
+Defense Evasion | T1105 | Payload download / external staging referenced in registry
+
+---
+
+## Detection Logic Summary
+
+The rule stacks multiple independent signals to identify meaningful persistence:
+
+- Scope limited to established persistence and hijack registry paths in HKLM and HKCU  
+- Payload inspection for encoded commands, URLs, domains, IP addresses, and executable/script extensions  
+- Initiator analysis for unsigned, rare, or untrusted processes modifying sensitive keys  
+- Signer and publisher reputation checks  
+- Prevalence weighting to elevate binaries seen on very few devices  
+
+Results are aggregated per Device + RegistryKey + ValueName and include:
+
+- Signal count and weighted severity  
+- Initiating process metadata  
+- Example command line and binary hash  
 - MITRE techniques  
-- Hunting directives
+- Analyst hunting directives for response
 
 ---
 
-## 🕵️‍♂️ Analyst Hunting Directives
+## Analyst Hunting Directives
 
-The rule emits a `HuntingDirectives` column with guidance like:
+The rule emits a HuntingDirectives field containing guidance such as:
 
-1. Review the exact persistence key and value on the host.  
-2. Confirm the binary and signer are expected in your environment.  
-3. Examine the command line for encoded or LOLBin-based execution.  
-4. Pivot on `ProcSHA` and signer to see where else it exists.  
-5. If suspicious, remove the registry value and quarantine the binary.  
-6. Correlate with recent processes, network traffic, and alerts.  
-7. Map activity to MITRE for reporting and incident timeline.  
+1. Review the exact registry location and confirm its intent.  
+2. Validate the binary, signer, and company information of the initiating process.  
+3. Examine payloads for encoded or LOLBin-driven execution.  
+4. Pivot on ProcSHA to determine spread across devices.  
+5. If malicious, remove or quarantine the registry value and the referenced binary.  
+6. Correlate with recent process launches, network activity, and endpoint alerts.  
+7. Map findings to MITRE techniques for incident reporting.
 
-This is tuned for **L3 analysts** performing low-noise, high-context hunts.
-
----
-
-## 🧬 Supply-Chain & Famous Attack Relevance
-
-This registry persistence hunt supports analysis of:
-
-- **NotPetya / M.E.Doc-style wipers** – Service persistence, run keys, and staged execution.  
-- **3CX Supply Chain** – Secondary DLL loaders persisting via Run / RunOnce or COM hijacks.  
-- **F5 / appliance-style pivots** – When attackers move from appliance into Windows estate and drop persistence.  
-- **APT & red-team tradecraft** – IFEO, COM, and LSA-based backdoors frequently used for stealthy long-term access.  
-
-While supply-chain infections begin elsewhere (trojanised updates, compromised vendor software), **the long-term foothold often ends up in exactly these registry paths**.
+This is designed for L3 investigations requiring low noise and high context.
 
 ---
 
-## 🧱 Example Output Fields
+## Supply-Chain and Notable Attack Relevance
 
-| Field | Description |
-|-------|-------------|
-| `DeviceName` | Host with suspicious persistence |
-| `RegistryKey`, `ValueName`, `ValueData` | Exact persistence location and payload |
-| `ProcUser` | User context performing the change |
-| `ProcSigner`, `ProcCompany` | Publisher metadata for the initiating binary |
-| `ProcSHA` | Hash to pivot across environment / VT |
-| `MaxSignals` | Combined signal weight (behaviour + rarity + signer) |
-| `ThreatSeverity` | CRITICAL / HIGH / MEDIUM derived from signal profile |
-| `MITRE_Tactics`, `MITRE_Techniques` | ATT&CK mapping |
-| `HuntingDirectives` | SOC-ready guidance for response |
+This persistence framework aligns with common post-compromise behaviour observed in major incidents:
 
-----
+- NotPetya and M.E.Doc — service persistence, run keys, staged loaders  
+- 3CX — secondary DLL loaders via Run keys and COM hijacks  
+- F5 and appliance transitions — registry footholds once attackers pivot into Windows estates  
+- APT and red-team tradecraft — heavy use of IFEO, COM, and LSA-based backdoors  
 
-## 🔗 Pairing Suggestions
+Supply-chain attacks may begin elsewhere, but durable access often ends in these registry paths.
 
-For maximum coverage, pair this rule with:
+---
 
-- **DLL & Driver Sideloading Hunt** (your existing rule)  
-- **Scheduled Task Persistence Hunt**  
-- **WMI Event Consumer Hunt**  
-- **OAuth Consent / Cloud Persistence Rule** (the one above)  
+## Example Output Fields
 
-Together, they form a strong **endpoint + cloud persistence** story for your portfolio.
+Field | Description
+------|------------
+DeviceName | Host containing suspicious persistence
+RegistryKey / ValueName / ValueData | Location and payload
+ProcUser | User context writing the registry value
+ProcSigner / ProcCompany | Publisher details of the modifying binary
+ProcSHA | Hash used for wider pivots and correlation
+MaxSignals | Weighted score combining behavioural, signer, and rarity signals
+ThreatSeverity | CRITICAL / HIGH / MEDIUM based on signal profile
+MITRE_Tactics / MITRE_Techniques | ATT&CK mapping for investigation
+HuntingDirectives | SOC-ready guidance for analyst response
+
+---
+
+## Pairing Suggestions
+
+For full coverage of persistence mechanisms, combine this rule with:
+
+- DLL and driver sideloading detection  
+- Scheduled task persistence hunt  
+- WMI event consumer hunt  
+- OAuth consent and cloud-persistence rule  
+
+Together, these form a comprehensive endpoint and cloud persistence package suitable for advanced threat-hunting operations and portfolio presentation.
