@@ -1,136 +1,82 @@
-// =============================================================
-// Supply-Chain & Sideloading / Driver Abuse Detection (TI-Free)
-// Behaviour-First Rule — Unknown Vendor Compromise Ready
-// Targets: 3CX, F5 BIG-IP, SolarWinds SUNBURST, NotPetya-style & Polymorphic Malware
-// Author: Ala Dabat 
-// Environment: Microsoft Defender for Endpoint Advanced Hunting
-// Tables: DeviceFileEvents, DeviceImageLoadEvents,
-//         DeviceRegistryEvents, DeviceNetworkEvents
-// =============================================================
+// ====================================================================
+// Supply-Chain, Sideloading & BYOVD Behaviour Detector (TI-Free)
+// Compact Production Version — L3 Behaviour-First
+// Author: Ala Dabat
+// ====================================================================
 
 let lookback = 14d;
-
-// Suspicious or user-writable directories
-let suspicious_folders = dynamic([
-  @"C:\ProgramData\",
-  @"C:\Users\",
-  @"C:\Temp\",
-  @"C:\Windows\Tasks\",
-  @"C:\Windows\Temp\"
-]);
-
-let high_value_processes = dynamic([
-  "3CXDesktopApp.exe",
-  "SolarWinds.BusinessLayerHost.exe",
-  "outlook.exe",
-  "teams.exe",
-  "explorer.exe",
-  "svchost.exe",
-  "services.exe",
-  "winlogon.exe",
-  "lsass.exe"
-]);
-
-let lolbin_loaders = dynamic([
-  "rundll32.exe","regsvr32.exe","mshta.exe",
-  "powershell.exe","wscript.exe","cscript.exe","cmd.exe"
-]);
-
-let registry_keywords = dynamic([
-  ".dll",".exe",".ps1",".bat",".vbs",".cmd",".js",
-  "rundll32.exe","mshta.exe","powershell.exe","cmd.exe"
-]);
-
 let dormant_window = 7d;
 let confidence_threshold = 3;
 
-// 1. File drops in suspicious locations
+let suspicious_folders = dynamic([@"C:\ProgramData\",@"C:\Users\",@"C:\Temp\",@"C:\Windows\Tasks\",@"C:\Windows\Temp\"]);
+let high_value_processes = dynamic(["3CXDesktopApp.exe","SolarWinds.BusinessLayerHost.exe","outlook.exe","teams.exe","explorer.exe","svchost.exe","services.exe","winlogon.exe","lsass.exe"]);
+let lolbin_loaders = dynamic(["rundll32.exe","regsvr32.exe","mshta.exe","powershell.exe","wscript.exe","cscript.exe","cmd.exe"]);
+let registry_keywords = dynamic([".dll",".exe",".ps1",".bat",".vbs",".cmd",".js","rundll32.exe","mshta.exe","powershell.exe","cmd.exe"]);
+
+// --- File Drops ---
 let file_drops =
-  DeviceFileEvents
-  | where Timestamp >= ago(lookback)
-  | where FolderPath has_any (suspicious_folders)
-  | extend FileExt = tolower(tostring(split(FileName,".",-1)[-1]))
-  | where FileExt in ("dll","sys","exe")
-  | extend IsDriver = FileExt == "sys", IsDLL = FileExt == "dll"
-  | project DropTime=Timestamp,DeviceId,DeviceName,FileName,FileExt,SHA256,
-            FolderPath,InitiatingProcessFileName,InitiatingProcessCommandLine;
+DeviceFileEvents
+| where Timestamp >= ago(lookback) and FolderPath has_any (suspicious_folders)
+| extend FileExt = tolower(tostring(split(FileName,".",-1)[-1])), IsDriver = FileExt=="sys", IsDLL = FileExt=="dll"
+| where FileExt in ("dll","sys","exe")
+| project DropTime=Timestamp,DeviceId,DeviceName,FileName,FileExt,SHA256,FolderPath,InitiatingProcessFileName,InitiatingProcessCommandLine;
 
-// 2. Unsigned / bad DLL or driver loads
+// --- DLL/Driver Loads (summarised) ---
 let image_loads =
-  DeviceImageLoadEvents
-  | where Timestamp >= ago(lookback)
-  | extend FileExt = tolower(tostring(split(ImageFileName,".",-1)[-1]))
-  | where FileExt in ("dll","sys")
-  | extend UnsignedOrBad = SignatureStatus in ("Unsigned","Invalid","Unknown") or isnull(Signer)
-  | where UnsignedOrBad == true
-  | project LoadTime=Timestamp,DeviceId,DeviceName,ProcessName,ProcessId,
-            ImageFileName,FileExt,ImageSHA256=SHA256,Signer,SignatureStatus;
+DeviceImageLoadEvents
+| where Timestamp >= ago(lookback)
+| extend FileExt = tolower(tostring(split(ImageFileName,".",-1)[-1]))
+| where FileExt in ("dll","sys")
+| extend BadSig = SignatureStatus in ("Unsigned","Invalid","Unknown") or isnull(Signer)
+| where BadSig
+| summarize LoadTime=min(Timestamp),LoaderProcess=any(ProcessName),ImageFileName=any(ImageFileName),ImageSHA256=any(SHA256),Signer=any(Signer),SignatureStatus=any(SignatureStatus) by DeviceId,SHA256;
 
-// 3. Registry-based execution/persistence
-let reg_persistence =
-  DeviceRegistryEvents
-  | where Timestamp >= ago(lookback)
-  | where ActionType in ("RegistryValueSet","RegistryValueAdded")
-  | where RegistryValueData has_any (registry_keywords)
-  | project RegTime=Timestamp,DeviceId,DeviceName,RegistryKey,RegistryValueData,
-            RegInitiatingProcessFileName=InitiatingProcessFileName,
-            RegInitiatingProcessCommandLine=InitiatingProcessCommandLine;
+// --- Registry Persistence (summarised) ---
+let reg_agg =
+DeviceRegistryEvents
+| where Timestamp >= ago(lookback) and ActionType in ("RegistryValueSet","RegistryValueAdded")
+| where RegistryValueData has_any (registry_keywords)
+| summarize RegTime=min(Timestamp),RegistryKey=any(RegistryKey),RegistryValueData=any(RegistryValueData),RegProc=any(InitiatingProcessFileName),RegCmd=any(InitiatingProcessCommandLine) by DeviceId,ProcKey=InitiatingProcessFileName;
 
-// 4. Network downloads of executable components
-let net_downloads =
-  DeviceNetworkEvents
-  | where Timestamp >= ago(lookback)
-  | where isnotempty(RemoteUrl)
-  | where RemoteUrl has_any (".dll",".sys",".exe",".bin",".dat")
-  | project DownloadTime=Timestamp,DeviceId,DeviceName,RemoteUrl,RemoteIP,RemotePort,
-            NetInitiatingProcessFileName=InitiatingProcessFileName,
-            NetInitiatingProcessCommandLine=InitiatingProcessCommandLine;
+// --- Network Downloads (summarised) ---
+let net_agg =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback) and isnotempty(RemoteUrl) and RemoteUrl has_any (".dll",".sys",".exe",".bin",".dat")
+| where InitiatingProcessFileName !in ("msedge.exe","chrome.exe","firefox.exe","onedrive.exe","teams.exe")
+| summarize DownloadTime=min(Timestamp),RemoteUrl=any(RemoteUrl),RemoteIP=any(RemoteIP),RemotePort=any(RemotePort),NetProc=any(InitiatingProcessFileName),NetCmd=any(InitiatingProcessCommandLine) by DeviceId,ProcKey=InitiatingProcessFileName;
 
-// 5. Correlation of events
+// --- Correlated Behaviour ---
 file_drops
-| join kind=leftouter image_loads on DeviceId,DeviceName
-| join kind=leftouter net_downloads on DeviceId,DeviceName
-| join kind=leftouter reg_persistence on DeviceId,DeviceName
-| extend LoadDelayMin = iif(isnotempty(LoadTime),
-                            datetime_diff("minute",LoadTime,DropTime), real(null))
-
-// Flags
-| extend SuspiciousDLLFast = iff(IsDLL == true and isnotempty(LoadTime)
-                                 and LoadDelayMin between (0 .. 5), 1, 0)
-| extend ParentHighValue = iff(ProcessName in (high_value_processes), 1, 0)
-| extend LoaderIsLOLBIN = iff(InitiatingProcessFileName in (lolbin_loaders), 1, 0)
-| extend DormantDriver = iff(IsDriver == true and 
-                             DropTime <= now() - dormant_window and 
-                             isnull(LoadTime), 1, 0)
-| extend DormantDLL = iff(IsDLL == true and
-                          DropTime <= now() - dormant_window and
-                          isnull(LoadTime), 1, 0)
-
-// Confidence scoring — TI removed
+| join kind=leftouter image_loads on DeviceId,SHA256
+| join kind=leftouter reg_agg on $left.DeviceId==$right.DeviceId and InitiatingProcessFileName==ProcKey
+| join kind=leftouter net_agg on $left.DeviceId==$right.DeviceId and InitiatingProcessFileName==ProcKey
+| extend DroppedInWritable=iff(FolderPath has_any suspicious_folders,1,0),
+         LoadDelayMin=iff(isnotempty(LoadTime) and LoadTime>=DropTime,datetime_diff("minute",LoadTime,DropTime),real(null)),
+         SuspiciousDLLFast=iff(IsDLL and isnotempty(LoadTime) and LoadDelayMin between (0..5),1,0),
+         DropperHighValue=iff(InitiatingProcessFileName in (high_value_processes),1,0),
+         LoaderIsLOLBIN=iff(InitiatingProcessFileName in (lolbin_loaders) or LoaderProcess in (lolbin_loaders),1,0),
+         DormantDriver=iff(IsDriver and DropTime <= now()-dormant_window and isnull(LoadTime),1,0),
+         DormantDLL=iff(IsDLL and DropTime <= now()-dormant_window and isnull(LoadTime),1,0)
 | extend ConfidenceScore =
-    iif(DroppedInWritable == 1, 2, 0) +
-    iif(isnotempty(RegistryKey), 2, 0) +
-    iif(SuspiciousDLLFast == 1, 2, 0) +
-    iif(DormantDriver == 1, 3, 0) +
-    iif(ParentHighValue == 1, 2, 0) +
-    iif(LoaderIsLOLBIN == 1, 1, 0) +
-    iif(DormantDLL == 1, 3, 0)
-
-// Reason
+         iif(DroppedInWritable==1,1,0) +
+         iif(isnotempty(RegistryKey),2,0) +
+         iif(SuspiciousDLLFast==1,2,0) +
+         iif(DormantDriver==1,3,0) +
+         iif(DropperHighValue==1,2,0) +
+         iif(LoaderIsLOLBIN==1,1,0) +
+         iif(DormantDLL==1,3,0)
 | extend Reason =
-  case(
-    DormantDriver == 1, "Dormant unsigned driver in writable path (BYOVD-style)",
-    DormantDLL == 1, "Dormant DLL in writable path (SolarWinds-style)",
-    SuspiciousDLLFast == 1, "Fast DLL load within 5 minutes of drop (3CX-style)",
-    isnotempty(RegistryKey), "Registry persistence referencing executable",
-    isnotempty(RemoteUrl), "Executable component downloaded from remote URL",
-    "Behavioural anomaly"
-  )
-
+         case(
+           DormantDriver==1,"Dormant unsigned driver in writable path (BYOVD-style)",
+           DormantDLL==1,"Dormant DLL in writable path (SolarWinds-style)",
+           SuspiciousDLLFast==1,"Fast DLL load after drop (3CX-style)",
+           isnotempty(RegistryKey),"Registry persistence referencing executable",
+           isnotempty(RemoteUrl),"Executable component downloaded from remote URL",
+           "Behavioural anomaly in writable directory"
+         )
 | where ConfidenceScore >= confidence_threshold
-
-| project DropTime,LoadTime,DownloadTime,RegTime,DeviceName,FileName,SHA256,
-          FolderPath,ImageFileName,ProcessName,RemoteUrl,RemoteIP,RegistryKey,
-          RegistryValueData,SuspiciousDLLFast,DormantDriver,DormantDLL,
-          ConfidenceScore,Reason
+| project DropTime,LoadTime,DownloadTime,RegTime,DeviceName,FileName,FileExt,SHA256,FolderPath,
+          InitiatingProcessFileName,InitiatingProcessCommandLine,LoaderProcess,ImageFileName,
+          RemoteUrl,RemoteIP,RegistryKey,RegistryValueData,SuspiciousDLLFast,DormantDriver,
+          DormantDLL,DropperHighValue,LoaderIsLOLBIN,ConfidenceScore,Reason
 | order by DropTime desc
