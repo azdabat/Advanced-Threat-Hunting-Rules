@@ -1,7 +1,6 @@
 ////////////////////////////////////////////////////////////////////////////////////////////
 // Rule: LOLBins_Defense_Evasion_Patterns_V2
-// Author: Ala Dabat (Optimized by Gemini)
-// Version: 2025-11-Optimized
+// Author: Ala Dabat 
 // Purpose: Detect HIGH-FIDELITY LOLBins used for LSASS dumping, AMSI bypass, and encoded/obfuscated execution.
 // Tactics: Defense Evasion, Credential Access, Execution
 // Techniques: T1003.001, T1562.001, T1027, T1218, T1059.001
