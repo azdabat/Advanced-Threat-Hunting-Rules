@@ -30,7 +30,7 @@ let DllImageLoads =
 DeviceImageLoadEvents
 | where Timestamp >= ago(lookback)
 | where ImageFileName endswith ".dll"
-// | where DeviceName =~ targetHost   // optional scope
+// | where DeviceName =~ targetHost   // optional
 | project
     ImageLoadTime = Timestamp,
     DeviceId, DeviceName,
@@ -86,13 +86,11 @@ DeviceRegistryEvents
 | where RegistryKey has_any (PersistenceKeys)
 | project RegTime = Timestamp, DeviceId, DeviceName, RegistryKey, RegistryValueName, RegistryValueData;
 
-// ---- Lightweight network context (no TI) -----------------------------------
 let NetEnrich =
 DeviceNetworkEvents
 | where Timestamp >= ago(lookback)
 | project NetTime = Timestamp, DeviceId, DeviceName, RemoteIP, RemotePort, RemoteUrl, InitiatingProcessFileName, InitiatingProcessCommandLine;
 
-// ---- Build candidates: join prevalence + creation timing --------------------
 let Candidates =
 DllImageLoads
 | join kind=leftouter (OrgPrevalence) on $left.ImageSHA256 == $right.SHA256
@@ -112,7 +110,6 @@ DllImageLoads
     DormantLong           = iif(Seconds_CreateToLoad > dormantShortSec and Seconds_CreateToLoad <= tolong(dormantLongSec), 1, 0),
     DormantVeryLong       = iif(Seconds_CreateToLoad > tolong(dormantLongSec) and Seconds_CreateToLoad <= tolong(dormantVeryLongSec), 1, 0);
 
-// ---- Correlate with drivers (±2h), registry (±2h), and network (±2h) -------
 let WithDrivers =
 Candidates
 | join kind=leftouter (SysDrops) on DeviceId
@@ -128,7 +125,6 @@ WithReg
 | join kind=leftouter (NetEnrich) on DeviceId
 | where isnull(NetTime) or (NetTime between (ImageLoadTime .. ImageLoadTime + 2h));
 
-// ---- Scoring (native only) --------------------------------------------------
 WithNet
 | extend
     BehaviorScore =
@@ -182,12 +178,8 @@ WithNet
     ImageFileName, ImageSHA256, SignatureStatus, Signer,
     Seconds_CreateToLoad, FastLoad, DormantShort, DormantLong, DormantVeryLong,
     SeenDeviceCount,
-    // Driver correlation
     DriverTime, SysFile, SysFolder, SysSigner, SysInitiator, SysCmd,
-    // Registry correlation
     RegTime, RegistryKey, RegistryValueName, RegistryValueData,
-    // Minimal network context
     NetTime, RemoteIP, RemotePort, RemoteUrl,
-    // MITRE + directives
     MITRE_Tactics, MITRE_Techniques, ThreatHunterDirectives
 | order by Severity desc, FinalScore desc, ImageLoadTime desc
