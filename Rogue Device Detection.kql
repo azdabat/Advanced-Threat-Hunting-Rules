@@ -1,6 +1,6 @@
 // ============================================================================
 // Rogue Device Detection (Naming Deviation + Missing EDR Onboarding)
-// Author: Ala Dabat (Alstrum) | Version: 2025-11
+// Author: Ala Dabat | Version: 2025-11
 // Purpose: Detect unmanaged, spoofed, or attacker-created devices.
 // MITRE: T1078 (Valid Accounts), T1606 (Forge Web Credentials),
 //        T1557 (Adversary-in-the-middle), T1087 (Account/Host Discovery)
