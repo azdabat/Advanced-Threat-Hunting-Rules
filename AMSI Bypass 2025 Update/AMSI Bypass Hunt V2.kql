@@ -14,7 +14,7 @@
 let Lookback      = 7d;
 let MinRiskScore  = 7;
 
-// High-signal LOLBins — we expect low volume here
+// High-signal LOLBins 
 let LolBins = dynamic([
     "rundll32.exe","regsvr32.exe","mshta.exe","wmic.exe",
     "wscript.exe","cscript.exe","powershell.exe",
