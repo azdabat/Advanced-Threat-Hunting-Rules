@@ -61,7 +61,7 @@ SecurityEvent
 
 
 // ===============================================
-// 1️⃣ Detect devices with non-standard names or missing EDR onboarding
+//  Detect devices with non-standard names or missing EDR onboarding
 // Purpose: Identify rogue devices that are either not onboarded to EDR or do not follow approved naming conventions.
 // ===============================================
 
@@ -85,7 +85,7 @@ DeviceInfo
 // you could join with a MISP table containing known compromised hosts to boost scoring.
 
 // ===============================================
-// 2️⃣ Detect suspicious LDAP/LDAPS connections from a host
+// 2️ Detect suspicious LDAP/LDAPS connections from a host
 // Purpose: Track possible reconnaissance or exfil attempts over LDAP/LDAPS from suspicious hosts
 // ===============================================
 
@@ -106,7 +106,7 @@ DeviceNetworkEvents
 | order by TotalScore desc, Timestamp desc
 
 // ===============================================
-// 3️⃣ Detect suspicious processes and commands related to AD/kerberos attacks
+// 3️ Detect suspicious processes and commands related to AD/kerberos attacks
 // Purpose: Identify attacks like Kerberoasting, SPN harvesting, or NTDS dumps
 // ===============================================
 
@@ -127,7 +127,7 @@ DeviceProcessEvents
 | order by TotalScore desc, Timestamp desc
 
 // ===============================================
-// 4️⃣ Domain Controller pivot: SPN reads & TGS requests
+// 4️ Domain Controller pivot: SPN reads & TGS requests
 // Purpose: Detect reconnaissance and Kerberos ticket abuse on DCs (Golden Ticket or Kerberoast)
 // ===============================================
 
@@ -165,6 +165,7 @@ SecurityEvent
 ) on $left.Requestor == $right.TI_Indicator or $left.SPN == $right.TI_Indicator
 | extend TotalScore = coalesce(TI_Score,0)
 | order by TGSRequests desc, TotalScore desc
+
 
 
 
