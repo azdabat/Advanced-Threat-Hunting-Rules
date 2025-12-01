@@ -53,7 +53,7 @@ DeviceProcessEvents
         "Suspicious LOLBin Activity"
     )
 
-// Scoring model: compact, human-weighted
+// scoring model
 | extend Risk =
     case(
         ActivityType == "LSASS Dump",           10,
