@@ -1,0 +1,117 @@
+// ============================================================================
+// Rule Name: Suspicious Git Submodule / Hook Abuse Hunt
+// Author: Ala Dabat
+// Purpose:
+//   Identify suspicious Git activity involving submodules or hook files,
+//   which adversaries can use for code execution or persistence.
+// Data Sources: DeviceProcessEvents, DeviceFileEvents, DeviceInfo
+// MITRE: TA0002 Execution, TA0003 Persistence, TA0005 Defense Evasion
+// Kill Chain: Execution → Persistence
+// ============================================================================
+
+let lookback = 7d;
+
+// ---------------------------------------------------------------------------
+// Stage 1 — Git executions referencing submodules or hook paths
+// ---------------------------------------------------------------------------
+let GitExec =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName =~ "git.exe"
+| extend Cmd = tolower(ProcessCommandLine)
+| where Cmd has_any ("submodule","--recurse-submodules","--recurse","clone",".git/hooks","hookspath")
+| extend
+    WorkingDir  = FolderPath,
+    UserAccount = coalesce(AccountUpn, strcat(AccountDomain, "\\", AccountName))
+| project Timestamp, DeviceId, DeviceName,
+          WorkingDir, UserAccount,
+          GitCmd = ProcessCommandLine,
+          ParentProc = InitiatingProcessFileName,
+          ParentCmd  = InitiatingProcessCommandLine;
+
+// ---------------------------------------------------------------------------
+// Stage 2 — Hook file creation/modification under .git/hooks
+// ---------------------------------------------------------------------------
+let GitHooks =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FileModified")
+| where FolderPath has ".git\\hooks"
+| where tolower(FileName) !in ("readme","sample")
+| project HookTime = Timestamp, DeviceId,
+          HookFile = FileName,
+          HookPath = FolderPath,
+          HookSHA  = SHA256;
+
+// ---------------------------------------------------------------------------
+// Stage 3 — Correlate git executions with hook writes within ±30 minutes
+// ---------------------------------------------------------------------------
+GitExec
+| join kind=inner (
+    GitHooks
+    | project HookTime, DeviceId, HookFile, HookPath, HookSHA
+) on DeviceId
+| where HookTime between (Timestamp - 30m .. Timestamp + 30m)
+| summarize
+    FirstSeen     = min(Timestamp),
+    LastSeen      = max(Timestamp),
+    GitExecCount  = dcount(GitCmd),
+    WorkingDirs   = make_set(WorkingDir, 5),
+    HookFiles     = make_set(HookFile, 5),
+    HookPaths     = make_set(HookPath, 5),
+    SampleGitCmd  = any(GitCmd),
+    SampleParent  = any(ParentProc),
+    SampleParentCmd = any(ParentCmd),
+    SampleUser    = any(UserAccount),
+    SampleHookSHA = any(HookSHA)
+  by DeviceId, DeviceName
+
+// ---------------------------------------------------------------------------
+// Device context
+// ---------------------------------------------------------------------------
+| join kind=leftouter (
+    DeviceInfo
+    | project DeviceId, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags
+) on DeviceId
+
+// ---------------------------------------------------------------------------
+// Scoring & Severity
+// ---------------------------------------------------------------------------
+| extend
+    Score =
+        40
+        + iif(DeviceCategory =~ "Server", 10, 0)
+        + iif(ExposureLevel =~ "High", 10, 0)
+
+| extend Severity =
+    case(Score >= 80, "HIGH",
+         Score >= 60, "MEDIUM",
+         "LOW")
+
+| extend
+    MITRE_Tactics    = "TA0002 Execution; TA0003 Persistence; TA0005 Defense Evasion",
+    MITRE_Techniques = "T1059 Command Shell; Git Hook Modification (custom mapping)",
+    KillChainStage   = "Execution → Persistence"
+
+// ---------------------------------------------------------------------------
+// Analyst workflow
+// ---------------------------------------------------------------------------
+| extend HuntingDirectives = pack_array(
+    strcat("Check Git activity on ", DeviceName, " involving submodules or hooks."),
+    strcat("User: ", SampleUser),
+    strcat("Command: ", SampleGitCmd),
+    strcat("Hook files: ", tostring(HookFiles)),
+    strcat("Hook paths: ", tostring(HookPaths)),
+    "Verify whether repository manipulation is expected.",
+    "Inspect hook SHA256 in threat intel sources.",
+    "If malicious: remove hooks, rotate credentials, review impacted repos."
+)
+
+| project FirstSeen, LastSeen, Severity, Score,
+          DeviceName, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags,
+          WorkingDirs, HookFiles, HookPaths,
+          SampleGitCmd, SampleParent, SampleParentCmd,
+          SampleUser, SampleHookSHA,
+          KillChainStage, MITRE_Tactics, MITRE_Techniques,
+          HuntingDirectives
+| order by Severity desc, LastSeen desc
