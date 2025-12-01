@@ -108,16 +108,16 @@ Each result includes a pre‑built VirusTotal link and analyst directives such a
 
 ---
 
-## 📄 Analyst Workflow (HuntingDirectives)
+## Analyst Workflow (HuntingDirectives)
 
-1. ✅ Confirm driver legitimacy via vendor or signing certificate.  
-2. 🔍 Review `InitiatingProcessFileName` and command line (sc.exe, fltmc, etc.).  
-3. 🧬 Investigate driver creation path and timeline correlation.  
-4. 🕒 If `Delayed (>7d)` → look for prior persistence artifacts.  
-5. 🌐 Open `VT_File` link for hash reputation check.  
-6. 🔁 Pivot hash across your environment for propagation.  
-7. 🧰 Examine memory, LSASS, AMSI or kernel tampering post‑load.  
-8. 🔒 Contain and remediate — isolate host, remove driver, apply WDAC/HVCI block rules.  
+1.  Confirm driver legitimacy via vendor or signing certificate.  
+2.  Review `InitiatingProcessFileName` and command line (sc.exe, fltmc, etc.).  
+3.  Investigate driver creation path and timeline correlation.  
+4.  If `Delayed (>7d)` → look for prior persistence artifacts.  
+5.  Open `VT_File` link for hash reputation check.  
+6.  Pivot hash across your environment for propagation.  
+7.  Examine memory, LSASS, AMSI or kernel tampering post‑load.  
+8.  Contain and remediate — isolate host, remove driver, apply WDAC/HVCI block rules.  
 
 ---
 
