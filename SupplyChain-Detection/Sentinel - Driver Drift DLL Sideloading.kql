@@ -1,0 +1,77 @@
+// ==========================================================
+// Sentinel Hunt — DLL Sideloading / Driver Staging / Persistence
+// Author: Ala Dabat
+// ==========================================================
+
+let Window = 14d;
+let PrevalenceWindow = 90d;
+let FastLoadSec = 300;
+let LongDormancySec = 604800;
+let AlertScore = 32;
+
+let Prevalence =
+DeviceFileEvents
+| where TimeGenerated >= ago(PrevalenceWindow)
+| summarize SeenDevices = dcount(DeviceId) by SHA256;
+
+let Loads =
+DeviceImageLoadEvents
+| where TimeGenerated >= ago(Window)
+| project LoadTime = TimeGenerated, DeviceId, DeviceName,
+          DLL = ImageFileName, DLL_SHA256 = tostring(coalesce(SHA256, ImageHash)),
+          Loader = ProcessFileName, Signer, SignatureStatus;
+
+let Creates =
+DeviceFileEvents
+| where TimeGenerated >= ago(Window)
+| where FileName endswith ".dll"
+| project CreateTime = TimeGenerated,
+          DeviceId, FileName, FolderPath, SHA256;
+
+let Reg =
+DeviceRegistryEvents
+| where TimeGenerated >= ago(Window)
+| where ActionType == "RegistryValueSet"
+| where RegistryValueData has ".dll"
+      or RegistryKey has @"InprocServer32"
+      or RegistryKey has @"ServiceDll"
+| project RegTime = TimeGenerated, DeviceId, RegistryKey, RegistryValueData;
+
+let Drivers =
+DeviceFileEvents
+| where TimeGenerated >= ago(Window)
+| where FileName endswith ".sys"
+| project DriverTime = TimeGenerated, DeviceId, SysName = FileName, SysPath = FolderPath;
+
+let Core =
+Loads
+| join kind=leftouter Creates on DeviceId, DLL_SHA256 == SHA256
+| join kind=leftouter Prevalence on DLL_SHA256 == SHA256
+| extend Seconds_CreateToLoad =
+    iff(isnotempty(CreateTime), datetime_diff("second", LoadTime, CreateTime), real(null)),
+    RareDLL = iff(SeenDevices <= 2 or isnull(SeenDevices), 1, 0),
+    Unsigned = iff(SignatureStatus !in ("Signed","Valid") or isempty(Signer), 1, 0),
+    FastLoad = iff(Seconds_CreateToLoad between (0 .. FastLoadSec), 1, 0),
+    DormantLoad = iff(Seconds_CreateToLoad > FastLoadSec and Seconds_CreateToLoad <= LongDormancySec, 1, 0)
+| join kind=leftouter Drivers on DeviceId
+    and DriverTime between (LoadTime - 1h .. LoadTime + 1h)
+| join kind=leftouter Reg on DeviceId
+    and RegTime between (LoadTime - 1h .. LoadTime + 1h)
+| extend HasDriver = iff(isnotempty(SysName),1,0),
+         HasDLLReg = iff(isnotempty(RegistryValueData),1,0);
+
+Core
+| extend Score =
+      (5 * FastLoad) +
+      (4 * DormantLoad) +
+      (4 * Unsigned) +
+      (3 * RareDLL) +
+      (4 * HasDriver) +
+      (4 * HasDLLReg)
+| where Score >= AlertScore
+| project LoadTime, DeviceName, Loader, DLL, DLL_SHA256,
+          Seconds_CreateToLoad, Unsigned, RareDLL,
+          HasDriver, SysName, SysPath,
+          HasDLLReg, RegistryKey, RegistryValueData,
+          Score
+| order by Score desc
