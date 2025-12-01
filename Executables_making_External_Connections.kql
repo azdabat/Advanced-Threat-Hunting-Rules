@@ -1,27 +1,67 @@
-// Outbound .exe → Public IP Threat Hunt
+// ============================================================================
+// Hunt: Outbound Executable → Public IP Connections (Low Noise, High Context)
 // Author: Ala Dabat
-// Description: Identify all outbound connections from .exe processes to public IPs with DeviceInfo enrichment.
+// Purpose:
+//   Identify unusual outbound connections from executable processes to public IPs,
+// (tuning continues)
+// ============================================================================
 
 let lookback = 7d;
+
+// Device context
 let DevInfo =
     DeviceInfo
     | summarize arg_max(Timestamp, *) by DeviceId
-    | project DeviceId, DeviceName, OSPlatform, DeviceType, OnboardingStatus, ExposureLevel, PublicIP;
+    | project DeviceId, DeviceName, OSPlatform, DeviceType, ExposureLevel;
 
+// Core hunt: outbound connections from .exe processes to public IPs
+let Net =
 DeviceNetworkEvents
 | where Timestamp >= ago(lookback)
 | where RemoteIPType == "Public"
 | extend ProcName = tostring(InitiatingProcessFileName)
 | where ProcName endswith ".exe"
-| join kind=leftouter DevInfo on DeviceId
-| extend ThreatHunterDirectives = strcat(
-        "Validate outbound need for ", ProcName,
-        "; review RemoteIP=", RemoteIP,
-        " (", RemoteCountry, ")",
-        "; pivot across estate for same IP, URL or process; triage unusual countries or first-time connections."
-)
-| project Timestamp, DeviceName, DeviceType, OSPlatform, ExposureLevel, PublicIP,
-          ProcName, InitiatingProcessCommandLine, InitiatingProcessAccountUpn,
-          RemoteIP, RemoteCountry, RemoteUrl, RemotePort,
-          ThreatHunterDirectives
+| extend TotalBytes = tolong(SentBytes) + tolong(ReceivedBytes);
+
+// Scoring (light, avoids alert fatigue)
+let Scored =
+Net
+| extend
+    // Rare countries often matter more than the IP itself
+    CountrySuspicious = iif(RemoteCountry !in ("United Kingdom","United States","Ireland","Netherlands","Germany"), 1, 0),
+    // Large transfers look more like data movement
+    DataHeavy = iif(TotalBytes > 5000000, 1, 0),
+    // Known noisy processes suppressed
+    ProcessFiltered = iif(ProcName in ("chrome.exe","msedge.exe","teams.exe","outlook.exe","onedrive.exe"), 1, 0),
+    Score =
+        (2 * CountrySuspicious) +
+        (1 * iif(RemotePort notin (80,443), 1, 0)) +
+        (1 * iif(ProcessFiltered == 0, 1, 0)) +
+        (1 * DataHeavy)
+| where ProcessFiltered == 0    // remove browser/app noise entirely
+| join kind=leftouter DevInfo on DeviceId;
+
+// Final output
+Scored
+| extend Severity = case(
+        Score >= 4, "High",
+        Score >= 2, "Medium",
+        "Low"
+    ),
+    KillChainStage = case(
+        Score >= 4, "Command & Control / Potential Exfil",
+        Score >= 2, "Command & Control",
+        "Discovery / Initial Contact"
+    ),
+    ThreatHunterNotes = strcat(
+        "Review outbound connection to ", RemoteIP,
+        " (", RemoteCountry, ") by ", ProcName,
+        "; check command line and parent process; pivot across estate; verify legitimacy of remote host."
+    )
+| project
+    Timestamp, Severity, KillChainStage,
+    DeviceName, DeviceType, OSPlatform, ExposureLevel,
+    ProcName, InitiatingProcessCommandLine, InitiatingProcessAccountUpn,
+    RemoteIP, RemoteCountry, RemotePort, RemoteUrl, TotalBytes,
+    ThreatHunterNotes
 | order by Timestamp desc
