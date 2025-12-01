@@ -132,6 +132,7 @@ It also reflects how I structure, version, and refine analytic content as part o
 
 This is a personal research project.  
 All logic is written manually, referencing real attacker behaviour, public reports, and hands-on knowledge of endpoint and cloud telemetry.
+I have dozens of hunts offline but will introduce them at a pace to ensure high fedelity/noise Vs. Signal testing.
 
 As the repository evolves, rules will continue to be updated for:
 
@@ -141,6 +142,6 @@ As the repository evolves, rules will continue to be updated for:
 - Integration consistency  
 - Additional unit test datasets
 
-Feedback is 
+Feedback is welcome
 
 ---
