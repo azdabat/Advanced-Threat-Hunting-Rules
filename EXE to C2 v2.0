@@ -1,0 +1,79 @@
+// ============================================================================
+// RULE: Outbound EXE → Public IP Hunt (Hash Reputation + Scoring)
+// Author: Ala Dabat
+// Tactic Coverage: TA0011 (Command & Control), TA0005 (Defense Evasion)
+// Data Sources: DeviceNetworkEvents, DeviceInfo, DeviceFileEvents / FileHashInfo
+// ============================================================================
+
+let lookback = 7d;
+
+// Device context (latest per device)
+let DevInfo =
+    DeviceInfo
+    | summarize arg_max(Timestamp, *) by DeviceId
+    | project DeviceId, DeviceName, OSPlatform, DeviceType, ExposureLevel, PublicIP;
+
+// Hash reputation (Defender)
+let HashRep =
+    DeviceFileEvents
+    | where Timestamp >= ago(30d)
+    | summarize any(ThreatName) by SHA256
+    | extend Reputation =
+        case(
+            ThreatName has "Backdoor" or ThreatName has "Trojan", "Malicious",
+            ThreatName has "PUA", "Suspicious",
+            isnotempty(ThreatName), "KnownGood",
+            "Unknown"
+        )
+    | project SHA256, Reputation;
+
+// Rare country baseline
+let RareCountries = dynamic(["RU","CN","KP","IR"]);
+
+// Main hunt
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemoteIPType == "Public"
+| extend ProcName = tostring(InitiatingProcessFileName)
+| where ProcName endswith ".exe"
+| project Timestamp, DeviceId, ProcName,
+          InitiatingProcessCommandLine, InitiatingProcessAccountUpn,
+          SHA256, RemoteIP, RemoteCountry, RemoteUrl, RemotePort
+| join kind=leftouter DevInfo on DeviceId
+| join kind=leftouter HashRep on SHA256
+| extend Reputation = coalesce(Reputation, "Unknown")
+// Scoring
+| extend Score =
+      (iif(Reputation == "Malicious", 50,
+       iif(Reputation == "Suspicious", 30, 0)))
+    + iif(RemoteCountry in (RareCountries), 25, 0)
+    + iif(strtolower(InitiatingProcessCommandLine) contains "appdata", 15, 0)
+    + iif(DeviceType == "Server", 10, 0)
+| extend Severity =
+      case(
+        Score >= 70, "CRITICAL",
+        Score >= 45, "HIGH",
+        Score >= 20, "MEDIUM",
+        "LOW"
+      )
+| extend KillChain =
+      case(
+        Severity == "CRITICAL", "C2 Beacon / Data Exfil Staging",
+        Severity == "HIGH",     "C2 Pattern / Suspicious Outbound",
+        Severity == "MEDIUM",   "Unknown Outbound Activity",
+                                 "Baseline Outbound"
+      )
+// Analyst directives
+| extend HuntingDirectives = strcat(
+        "Outbound connection from ", ProcName,
+        " to ", RemoteIP, " (", RemoteCountry, "). ",
+        "SHA256 reputation=", Reputation,
+        ". Score=", tostring(Score),
+        ". Review lineage, execution context and cross-estate prevalence."
+)
+| project Timestamp, DeviceName, DeviceType, OSPlatform, ExposureLevel, PublicIP,
+          ProcName, InitiatingProcessCommandLine, InitiatingProcessAccountUpn,
+          SHA256, Reputation,
+          RemoteIP, RemoteCountry, RemoteUrl, RemotePort,
+          Score, Severity, KillChain, HuntingDirectives
+| order by Score desc, Timestamp desc
