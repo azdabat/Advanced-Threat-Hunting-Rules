@@ -153,3 +153,185 @@ Pivot on:
 ```kql
 DeviceProcessEvents
 | where FileName =~ "<SuspiciousBinary>"
+
+```
+# 6. Analyst Workflow, Pivots & Triage Procedures (Steps 6–9 Consolidated)
+
+This section provides a complete analyst workflow for investigating registry-based persistence, along with deep pivot guidance and validation steps used in L2/L3 SOC and Incident Response.
+
+---
+
+## 6.1 Event Validation & Initial Classification
+
+**Objective:** Determine whether the registry modification represents legitimate software behaviour or a malicious foothold.
+
+**Actions:**
+- Check the **initiating process** (signer, company, file path, hash reputation, prevalence).
+- Validate whether the registry path is expected for any installed application.
+- Review **ValueData** for suspicious execution paths such as:
+  - `%APPDATA%`, `%PUBLIC%`, `%TEMP%`
+  - URLs, IPs, or `.ps1/.vbs/.dll/.exe` payloads
+  - Encoded commands (Base64)
+- Confirm whether the change was performed by **administrative context**, which increases threat value.
+
+**Pivots:**
+- `DeviceProcessEvents` around the timestamp  
+- `DeviceNetworkEvents` for any payload retrieval  
+- `DeviceImageLoadEvents` for DLL persistence abuse  
+- `IdentityLogonEvents` for compromised accounts tied to registry actions  
+
+---
+
+## 6.2 Process Tree Reconstruction
+
+**Objective:** Build a reliable picture of how the registry key was created or modified.
+
+**Pipeline:**
+1. Start from the `InitiatingProcessFileName` and timestamp.
+2. Collect parent → child → grandchild lineage using:
+   - `InitiatingProcessParentFileName`
+   - `ProcessId` / `InitiatingProcessId`
+   - `ReportId` continuity
+3. Identify:
+   - Scripted loaders (`powershell.exe -enc`, `cmd.exe /c curl`)
+   - Loader chains (`mshta → rundll32 → regsvr32`)
+   - Sideloaded binaries or unsigned DLLs
+   - Uncommon or rare binaries (`LocalPrevalence ≤ 2`)
+
+**High-value pivots:**
+- `DeviceProcessEvents` (PID lineage and command lines)
+- `DeviceFileEvents` (payload creation before registry persistence)
+- `DeviceNetworkEvents` (stager download → registry installation)
+
+---
+
+## 6.3 Payload & Path Validation
+
+**Objective:** Determine whether the referenced payload is malicious, staged, or unknown.
+
+**Checks:**
+- Is the referenced executable/dll **signed and trusted**?
+- Was the file **recently created** or modified within ±2 minutes of registry event?
+- Does the path contain:
+  - `%TEMP%` / `%APPDATA%` / `ProgramData`
+  - Public writable directories
+  - Hidden subfolders
+- Does the **SHA256** hash appear:
+  - Rare across environment?
+  - Rare across global reputation?
+  - In any threat-intel dataset?
+
+**Pivots:**
+- `DeviceFileEvents` for creation timestamps  
+- `DeviceFileCertificateInfo` for signer trust  
+- `FileProfile` for prevalence & reputation  
+- VT/Hybrid-Analysis lookup using SHA256  
+
+---
+
+## 6.4 Cross-Signal Correlation
+
+**Objective:** Confirm that persistence is truly malicious by correlating multiple behaviours.
+
+Legitimate software rarely triggers *multiple* suspicious surfaces at the same time.
+
+**Cross-signal indicators include:**
+- Registry persistence **+** suspicious network connections  
+- Registry persistence **+** encoded PowerShell  
+- Registry persistence **+** file creation in user-writable paths  
+- Registry persistence **+** parent LOLBin (`mshta`, `rundll32`, `regsvr32`)  
+- Registry persistence **+** credential file access (rare but critical)
+
+**Correlate using:**
+- `union` of `Process`, `File`, `Network`, and `Registry` events around the detection time.
+- Look for “burst patterns” of execution within 2 minutes.
+
+---
+
+## 6.5 Lateral Expansion & Blast-Radius Mapping
+
+**Objective:** Assess whether the persistence belongs to a single endpoint or a broader intrusion campaign.
+
+**Queries:**
+- Hunt for identical registry values across environment.
+- Hunt for the same SHA256 across multiple hosts.
+- Hunt for the same IP/domain in `DeviceNetworkEvents`.
+- Verify whether the attacker moved laterally before persistence creation:
+  - Look for `ADMIN$` writes  
+  - NTLM/Kerberos authentication anomalies  
+  - RDP/PsExec patterns  
+
+**Recommended pivots:**
+- `DeviceNetworkEvents | summarize by RemoteIP, DeviceName`
+- `DeviceEvents | where ActionType == "ImageLoad"` for DLL hijacking
+- `SigninLogs` for account compromise checkpoints
+
+---
+
+## 6.6 Remediation, Containment & Forensic Notes
+
+**If confirmed malicious:**
+
+1. **Isolate host immediately**
+   - Prevent further credential theft, lateral movement, or persistence re-activation.
+
+2. **Export the registry key**
+   - Use:  
+     `reg export <path> <output>.reg`
+   - Store as evidence.
+
+3. **Extract payload referenced by the registry key**
+   - Preserve original timestamp and metadata.
+
+4. **Reset credentials** for:
+   - Local admin accounts
+   - Domain accounts tied to initiating processes
+   - Any high-value tier accounts
+
+5. **Search for lateral spread**
+   - Same SHA256  
+   - Same persistence key pattern  
+   - Same LOLBin invocation chain
+
+6. **Remove persistence key**
+   - Only after full forensic preservation.
+
+7. **Harden registry permissions**
+   - Validate ACLs for persistence-prone keys (`Run`, `RunOnce`, `Winlogon`, `AppInit_DLLs`).
+
+8. **Initiate threat-intel feedback**
+   - Feed IOCs (SHA256, URLs, domains) into your TI system for enrichment.
+
+---
+
+## 6.7 Key Pivots for IR & Threat Hunting Teams
+
+| Pivot Type | Table | Field(s) | Purpose |
+|------------|--------|----------|---------|
+| **Parent Process Reconstruction** | DeviceProcessEvents | ProcessId, InitiatingProcessId | Follow process lineage |
+| **Payload Creation** | DeviceFileEvents | FileName, SHA256, FolderPath | Validate if payload was staged |
+| **Network Retrieval** | DeviceNetworkEvents | RemoteIP, RemoteUrl | Identify download → persistence chains |
+| **Signed/Unsigned Checks** | DeviceFileCertificateInfo | IsTrusted, SignatureStatus | Confirm legitimacy |
+| **Executable/DLL Prevalence** | FileProfile | GlobalPrevalence, LocalPrevalence | Determine rarity of binary |
+| **Registry Tampering** | DeviceRegistryEvents | RegistryKey, ValueData | Root cause of persistence |
+| **Account Compromise Indicators** | SigninLogs / IdentityInfo | UserPrincipalName | Determine if attacker used stolen credentials |
+
+---
+
+## 6.8 IOC Catalogue (Persistence-Focused)
+
+| IOC Type | Examples |
+|----------|----------|
+| Suspicious Paths | `%APPDATA%\*.exe`, `C:\Users\Public\`, `%TEMP%\*.dll` |
+| Encoded Commands | PowerShell `-EncodedCommand`, Base64 payloads |
+| Known LOLBins | `mshta.exe`, `rundll32.exe`, `regsvr32.exe`, `certutil.exe` |
+| Network Persistence | `http://malicious.site/payload.exe` |
+| IFEO Debugger Keys | `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\*` |
+| LSA Plugins | `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\*` |
+| COM Hijacks | `InProcServer32` pointing to AppData DLLs |
+| Malicious Services | ImagePath to non-signed executables |
+
+---
+
+# End of Section 6–9 Consolidation
+
