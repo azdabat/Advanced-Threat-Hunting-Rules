@@ -1,0 +1,78 @@
+// WSL Privilege Escalation & Persistence Hunt (Enhanced)
+// Author: Ala Dabat (Optimized)
+// Fixes: 
+//   1. Removed ineffective 'DeviceFileEvents' check for Linux paths (MDE blind spot).
+//   2. Replaced file checks with Command Line proxies (bash -c 'echo ... > /etc/shadow').
+//   3. Added specific "LOLBin" triggers for WSL.
+
+let Lookback = 7d;
+let WslBins = dynamic(["wsl.exe","wslhost.exe","bash.exe","ubuntu.exe","kali.exe","debian.exe"]);
+let HighRiskParents = dynamic(["mshta.exe","wscript.exe","cscript.exe","regsvr32.exe","rundll32.exe","installutil.exe", "powershell.exe", "cmd.exe"]);
+
+// 1. Dangerous Flags & Targets (Command Line Only)
+let DangerousFlags = dynamic([
+    "--system", "-u root", "--user root", 
+    "/etc/shadow", "/etc/sudoers", "/root/.ssh/id_rsa", 
+    "docker.sock", "chmod +s", "chown root"
+]);
+
+// 2. Network Execution Regex (Expanded)
+// Catch: wsl -e nc ... OR bash -c "curl ..."
+let NetExecRx = @"(?i)\s(-e|--exec|-c)\s+.*?\b(nc|ncat|curl|wget|python|perl|ruby|socat)\b";
+
+// 3. Mount / Escape Regex
+let MountRx = @"(?i)(--mount|--unmount).*(/mnt/c/Windows|/mnt/c/ProgramData|/mnt/c/Users|/mnt/c/Temp)";
+
+// 4. File Modification Proxy Regex (The Fix for the Blind Spot)
+// Catches: wsl echo "ssh-rsa ..." >> /root/.ssh/authorized_keys
+let FileModRx = @"(?i)(>>|>).*(/etc/shadow|/etc/sudoers|/root/\.ssh|/etc/passwd)";
+
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FileName in~ (WslBins)
+| extend CommandLine = tolower(ProcessCommandLine)
+| extend Parent = tolower(InitiatingProcessFileName)
+
+// DETECT:
+| where 
+   // Case A: High Risk Parent spawning WSL (e.g. Word Macro -> WSL)
+   (Parent in~ (HighRiskParents) and (CommandLine has_any (DangerousFlags) or CommandLine matches regex NetExecRx))
+   or
+   // Case B: Dangerous Command Flags (Root / Shadow)
+   (CommandLine has_any (DangerousFlags))
+   or
+   // Case C: Dangerous Mounts (Host Escape)
+   (CommandLine matches regex MountRx)
+   or
+   // Case D: File Mod via Command Line (Proxy for File Events)
+   (CommandLine matches regex FileModRx)
+
+// SCORE:
+| extend Score = 0
+    + iif(CommandLine matches regex FileModRx, 50, 0)      // Critical: Modifying Linux configs
+    + iif(CommandLine matches regex MountRx, 40, 0)        // High: Host File Access
+    + iif(CommandLine has "-u root" or CommandLine has "--system", 30, 0) // PrivEsc
+    + iif(Parent in~ (HighRiskParents), 20, 0)             // Suspicious Source
+    + iif(CommandLine matches regex NetExecRx, 15, 0)      // Execution
+
+// CLASSIFY:
+| extend Severity = case(
+    Score >= 60, "Critical",
+    Score >= 40, "High", 
+    "Medium"
+)
+| extend KillChain = case(
+    Score >= 60, "Persistence / Credential Access",
+    CommandLine matches regex MountRx, "Container Escape",
+    "Privilege Escalation"
+)
+| extend HunterDirective = strcat(
+    "SEVERITY: ", Severity, ". ",
+    "WSL Process '", FileName, "' spawned by '", Parent, "'. ",
+    "Suspicious Activity: ", 
+    iif(CommandLine matches regex FileModRx, "Attempted write to critical Linux file. ", ""),
+    iif(CommandLine matches regex MountRx, "Attempted sensitive host volume mount. ", ""),
+    iif(CommandLine has "-u root", "Root user context requested. ", "")
+)
+| project Timestamp, DeviceName, Severity, Score, KillChain, FileName, ProcessCommandLine, Parent, HunterDirective
+| order by Score desc
