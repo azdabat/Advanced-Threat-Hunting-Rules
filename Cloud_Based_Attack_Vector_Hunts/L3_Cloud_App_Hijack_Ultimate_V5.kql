@@ -1,0 +1,98 @@
+// Rule: L3_Cloud_App_Hijack_Ultimate_V5
+// Ala Dabat
+// Purpose: Detect cloud app hijack via new secret → login, first-seen SPN logins, and geo/IP anomalies.
+// Data: AuditLogs, AADServicePrincipalSignInLogs
+// MITRE: T1098, T1078.004, T1550
+
+let lookback = 24h;
+let history  = 7d;
+let short_window = 2h;
+let long_window  = 24h;
+
+let KnownAutomation = dynamic([]);
+let HighRiskCountries = dynamic(["RU","CN","IR","KP"]);
+let SensitiveAppKeywords = dynamic(["Graph","Exchange","SharePoint","KeyVault","Admin","Security"]);
+let PrivilegedResourceKeywords = dynamic(["Graph","Directory","KeyVault","Security"]);
+let HighRiskIpPatterns = dynamic([".onion",".tor","vpn"]);
+
+// Stage 1 — Key additions
+let KeyAddsHistory = AuditLogs
+| where TimeGenerated > ago(30d)
+| where OperationName has "Certificates and secrets" and Result == "success"
+| mv-expand TargetResources
+| mv-expand TargetResources.modifiedProperties
+| extend Prop = tostring(TargetResources_modifiedProperties.displayName),
+         New  = tostring(TargetResources_modifiedProperties.newValue)
+| where Prop == "KeyDescription" and isnotempty(New)
+| extend AppId = tostring(TargetResources.id),
+         AppName = tostring(TargetResources.displayName),
+         Actor = tostring(InitiatedBy.user.userPrincipalName)
+| project KeyAdd_Time = TimeGenerated, Actor, AppId, AppName;
+
+// Stage 2 — SPN logins
+let SpnLoginsHistory = AADServicePrincipalSignInLogs
+| where TimeGenerated > ago(history)
+| extend Country = tostring(LocationDetails["countryOrRegion"])
+| project TimeGenerated, ServicePrincipalId, ServicePrincipalName, IPAddress, Country, ResourceDisplayName;
+
+let SpnFirstSeen = SpnLoginsHistory
+| summarize FirstSeen = min(TimeGenerated) by ServicePrincipalId;
+
+let SpnLogins = SpnLoginsHistory
+| where TimeGenerated > ago(lookback)
+| join kind=leftouter (SpnFirstSeen) on ServicePrincipalId
+| extend Login_Time = TimeGenerated,
+         SPN = ServicePrincipalId,
+         IP = IPAddress,
+         Country,
+         Resource = ResourceDisplayName,
+         IsFirstSeen = (Login_Time == FirstSeen);
+
+// Stage 3 — Key-add → login correlation
+let KillChainShort = KeyAddsHistory
+| join kind=inner (SpnLogins) on $left.AppId == $right.SPN
+| where (Login_Time - KeyAdd_Time) between (0min .. short_window)
+| extend CorrelationType = "ImmediateUse";
+
+let KillChainLong = KeyAddsHistory
+| join kind=inner (SpnLogins) on $left.AppId == $right.SPN
+| where (Login_Time - KeyAdd_Time) between (short_window .. long_window)
+| extend CorrelationType = "DelayedUse";
+
+// Stage 4 — Abuse of existing secrets
+let AppsWithRecentKeys = KeyAddsHistory
+| where KeyAdd_Time > ago(history)
+| distinct AppId;
+
+let ExistingAbuse = SpnLogins
+| where SPN !in (AppsWithRecentKeys)
+| extend CorrelationType = case(IsFirstSeen, "FirstSeenExistingSecret", "GeoOrIPAnomaly");
+
+// Stage 5 — Combine & enrich
+union KillChainShort, KillChainLong, ExistingAbuse
+| where AppId !in (KnownAutomation)
+| extend AppName = iff(isnull(AppName), ServicePrincipalName, AppName),
+         Actor   = iff(isnull(Actor), "N/A", Actor),
+         SensitiveApp   = AppName has_any (SensitiveAppKeywords),
+         PrivilegedRes  = Resource has_any (PrivilegedResourceKeywords),
+         HighRiskGeo    = Country in (HighRiskCountries),
+         SuspiciousIP   = IP has_any (HighRiskIpPatterns)
+| extend RiskScore =
+    40
+    + iif(CorrelationType == "ImmediateUse", 40, 0)
+    + iif(CorrelationType == "DelayedUse", 20, 0)
+    + iif(CorrelationType == "FirstSeenExistingSecret", 30, 0)
+    + iif(CorrelationType == "GeoOrIPAnomaly" and (HighRiskGeo or SuspiciousIP), 20, 0)
+    + iif(SensitiveApp, 10, 0)
+    + iif(PrivilegedRes, 10, 0)
+| extend Severity = case(RiskScore >= 90, "Critical", RiskScore >= 70, "High", "Medium")
+| extend Hunter_Directive = case(
+    CorrelationType == "ImmediateUse", strcat("Secret added to '", AppName, "' then used immediately from ", IP),
+    CorrelationType == "DelayedUse", strcat("Secret added to '", AppName, "' then used within 24h from ", IP),
+    CorrelationType == "FirstSeenExistingSecret", strcat("First recorded login for SPN '", ServicePrincipalName, "' from ", IP),
+    CorrelationType == "GeoOrIPAnomaly", strcat("SPN login from unusual geo/IP: ", Country, "/", IP),
+    "Review SPN activity"
+)
+| project Severity, RiskScore, CorrelationType, KeyAdd_Time, Login_Time, Actor,
+          AppId, AppName, ServicePrincipalName, IP, Country, Resource, Hunter_Directive
+| order by RiskScore desc, Login_Time desc
