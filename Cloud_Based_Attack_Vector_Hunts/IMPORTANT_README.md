@@ -112,62 +112,32 @@ Examples:
 
 # Cloud + Endpoint Architecture
 
-```mermaid
 flowchart LR
-    A[Cloud Identity Logs<br/>SigninLogs / AuditLogs / SPN Logs] -->|Authentication Behaviour| B[Sentinel Cloud Rules]
-    C[Endpoint Telemetry<br/>DeviceProcessEvents / FileEvents] -->|Execution Behaviour| D[MDE Endpoint Rules]
-    B --> E[Correlation & Hunting<br/>Cloud ↔ Endpoint]
+    A[Cloud Identity Logs] --> B[Sentinel Cloud Rules]
+    C[Endpoint Telemetry] --> D[MDE Endpoint Rules]
+    B --> E[Correlation and Hunting]
     D --> E
-    E --> F[Kill Chain Reconstruction<br/>Initial Access → Execution → Persistence → Escalation]
+    E --> F[Kill Chain Reconstruction]
+
+
 sequenceDiagram
     participant Attacker
     participant VPN
     participant Cloud
     participant Endpoint
-    participant RMM
     participant SPN
 
-    Attacker->>VPN: First-time VPN login from NEW IP/Geo
-    VPN->>Cloud: Sign-in logged in Sentinel
-    Cloud-->>SOC: Cloud rule triggers (New IP)
+    Attacker->>VPN: First-time VPN login from new IP
+    VPN->>Cloud: Sign-in logged
+    Cloud-->>Attacker: Cloud alert triggered
 
-    Attacker->>Endpoint: Deploy RMM (AnyDesk/RustDesk/ScreenConnect)
-    Endpoint->>RMM: Execution telemetry
-    Endpoint-->>SOC: MDE Rule triggers (RMM execution)
+    Attacker->>Endpoint: Deploy RMM tool
+    Endpoint->>Cloud: MDE alerts for RMM execution
 
-    Attacker->>Cloud: Add App Secret to SPN
-    Cloud->>SPN: SPN logs in using stolen secret
-    Cloud-->>SOC: Cloud App Hijack Rule triggers (Secret Added → SPN Login)
+    Attacker->>Cloud: Add App Secret
+    Cloud->>SPN: SPN login using new secret
+    Cloud-->>Attacker: Cloud Hijack alert triggered
 
-    Attacker->>CorpNetwork: Privilege Escalation + Lateral Movement
-```
-
-```graph TD
-    A1[Initial Access<br/>T1078 Valid Accounts]:::init
-    A2[T1133 External Remote Services]:::init
-
-    B1[Execution<br/>T1218 Signed Binary Proxy Execution]:::exec
-    B2[T1059 Script Execution]:::exec
-
-    C1[Persistence<br/>T1053 Scheduled Tasks]:::pers
-    C2[T1219 Remote Access Software]:::pers
-
-    D1[Privilege Escalation<br/>T1098 Account Manipulation]:::priv
-    D2[T1550 Token Impersonation/Replay]:::priv
-
-    E1[Credential Access<br/>T1081 Password Files]:::cred
-    E2[T1552 Credentials in Files]:::cred
-
-    F1[Defense Evasion<br/>T1218 LOLBIN Abuse]:::ev
-    F2[T1140 Deobfuscation]:::ev
-
-    classDef init fill:#ffb3b3,stroke:#333;
-    classDef exec fill:#b3ffb3,stroke:#333;
-    classDef pers fill:#ffd699,stroke:#333;
-    classDef priv fill:#b3d1ff,stroke:#333;
-    classDef cred fill:#fff5b3,stroke:#333;
-    classDef ev fill:#e0e0e0,stroke:#333;
-```
 Cloud Detection Rules — Sentinel
 
 | Rule Name                        | Purpose                                   | Detects                       | MITRE               |
@@ -232,6 +202,39 @@ flowchart TD
 
     E --> E1[Document Kill Chain]
     E --> E2[Improve Detections]
+
+```
+
+# Endpoint Detection Rules Table (RAW GitHub Markdown)
+
+| Rule Name                          | Purpose                                | Detects                     | MITRE        |
+| ---------------------------------- | -------------------------------------- | --------------------------- | ------------ |
+| Universal_LOLBIN_Execution_Hunt_V4 | Detect mshta/regsvr32/rundll32 misuse  | AWL bypass, proxy execution | T1218        |
+| Sensitive_Data_Recon_Hunt_V4       | Password/credential recon              | sensitive file discovery    | T1081, T1552 |
+| Polymorphic_Persistence_Hunt_V4    | Scheduled Task persistence             | LOLBIN persistence          | T1053.005    |
+| Compiler_Downloader_LOLBIN_Hunt    | certutil/curl/wget/msbuild downloaders | Malware staging             | T1105        |
+| RMM_Execution_Hunt                 | AnyDesk/RustDesk/ScreenConnect         | Remote control persistence  | T1219        |
+
+
+##
+| Family                     | Rule Names                                                                                                                                             | Description                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------- |
+| **Cloud Rules – Sentinel** | Cloud_App_Hijack_Ultimate_V5, SPN_Impossible_Travel_V5, SPN_First_Login_V5, SPN_Privilege_Abuse_V5, VPN_RMM_KillChain_V5                               | Detect identity, SPN, OAuth, VPN anomalies        |
+| **Endpoint Rules – MDE**   | Universal_LOLBIN_Execution_Hunt_V4, Polymorphic_Persistence_Hunt_V4, Compiler_Downloader_LOLBIN_Hunt, Sensitive_Data_Recon_Hunt_V4, RMM_Execution_Hunt | Detect execution, persistence, LOLBIN, RMM, recon |
+
+Quick Guide Table
+| Scenario                   | Example                              | Rule Type           | Reason                  |
+| -------------------------- | ------------------------------------ | ------------------- | ----------------------- |
+| First-time VPN login       | New IP from foreign country          | Sentinel Cloud Rule | Identity/auth anomaly   |
+| RMM execution              | anydesk.exe on workstation           | MDE Endpoint Rule   | Execution behaviour     |
+| App Secret Added           | New secret added to App Registration | Cloud Rule          | Control-plane behaviour |
+| Scheduled Task persistence | `schtasks /create`                   | MDE Rule            | Local persistence       |
+| SPN using Graph API        | SPN hits Directory/KeyVault          | Cloud Rule          | Token/privilege misuse  |
+| rundll32 DLL abuse         | DLL from TEMP                        | MDE Rule            | Execution attack        |
+
+
+
+
 
 
 
