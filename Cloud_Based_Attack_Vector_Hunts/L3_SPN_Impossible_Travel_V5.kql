@@ -1,0 +1,19 @@
+// Rule: L3_SPN_Impossible_Travel_V5
+// Author: Ala Dabat
+// Purpose: Detect SPN sign-ins from different countries within 1 hour.
+// Data: AADServicePrincipalSignInLogs
+// MITRE: T1078.004
+
+let lookback = 24h;
+let window = 1h;
+
+AADServicePrincipalSignInLogs
+| where TimeGenerated > ago(lookback)
+| extend Country = tostring(LocationDetails["countryOrRegion"])
+| summarize FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated), 
+            Countries=make_set(Country), Count=count()
+    by ServicePrincipalId, ServicePrincipalName
+| where array_length(Countries) > 1 and (LastSeen - FirstSeen) < window
+| extend Severity="Medium", RiskScore=60,
+         Hunter_Directive=strcat("Multiple-country SPN activity within ", tostring(window))
+| project Severity, RiskScore, ServicePrincipalId, ServicePrincipalName, Countries, FirstSeen, LastSeen, Hunter_Directive
