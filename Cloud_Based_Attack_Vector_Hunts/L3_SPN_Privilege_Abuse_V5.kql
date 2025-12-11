@@ -1,0 +1,20 @@
+// Rule: L3_SPN_Privilege_Abuse_V5
+// Author Ala Dabat
+// Purpose: Detect SPNs accessing privileged cloud resources (Graph, Directory, KeyVault).
+// Data: AADServicePrincipalSignInLogs
+// MITRE: T1550, T1098
+
+let lookback = 24h;
+let Privileged = dynamic(["Graph","Directory","KeyVault","Security","Exchange","SharePoint"]);
+let KnownSafeSPNs = dynamic([]);
+
+AADServicePrincipalSignInLogs
+| where TimeGenerated > ago(lookback)
+| where ResultType == "0"
+| extend Resource=ResourceDisplayName
+| where Resource has_any (Privileged) and ServicePrincipalId !in (KnownSafeSPNs)
+| summarize FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated), Count=count()
+    by ServicePrincipalId, ServicePrincipalName, Resource
+| extend Severity="High", RiskScore=70,
+         Hunter_Directive=strcat("Privileged resource access: ", Resource)
+| project Severity, RiskScore, ServicePrincipalId, ServicePrincipalName, Resource, Count, FirstSeen, LastSeen, Hunter_Directive
