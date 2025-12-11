@@ -1,0 +1,48 @@
+// Rule: L3_Polymorphic_Persistence_Hunt_V4
+// Purpose: // Rule: L3_Polymorphic_Persistence_Hunt_V4
+// Purpose: Detect Scheduled Task persistence using LOLBINs and Temp/Public paths.
+// Data: DeviceProcessEvents
+// MITRE: T1053.005
+
+let lookback = 24h;
+let LOLBINs = dynamic(["cmd","powershell","pwsh","wscript","cscript","mshta","rundll32","regsvr32","bash","wsl"]);
+let SuspiciousPaths = dynamic(["\\AppData\\Local\\Temp","\\AppData\\Roaming","\\ProgramData","\\Public","\\Downloads","\\Music"]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName =~ "schtasks.exe" and ProcessCommandLine has "/create"
+| extend TaskRun = extract("(?i)/tr\\s+\"*([^/][^\"]+)\"*", 1, ProcessCommandLine)
+| extend RiskScore =
+    0
+    + iif(TaskRun has_any (LOLBINs), 30, 0)
+    + iif(TaskRun has_any (SuspiciousPaths), 50, 0)
+    + iif(ProcessCommandLine has "/ru system", 20, 0)
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    RiskScore >= 70, "Scheduled Task persistence via LOLBIN",
+    "Suspicious Scheduled Task creation"
+)
+| project TimeGenerated, DeviceName, TaskRun, RiskScore, Hunter_Directive, ProcessCommandLine
+
+// Data: DeviceProcessEvents
+// MITRE: T1053.005
+
+let lookback = 24h;
+let LOLBINs = dynamic(["cmd","powershell","pwsh","wscript","cscript","mshta","rundll32","regsvr32","bash","wsl"]);
+let SuspiciousPaths = dynamic(["\\AppData\\Local\\Temp","\\AppData\\Roaming","\\ProgramData","\\Public","\\Downloads","\\Music"]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(lookback)
+| where FileName =~ "schtasks.exe" and ProcessCommandLine has "/create"
+| extend TaskRun = extract("(?i)/tr\\s+\"*([^/][^\"]+)\"*", 1, ProcessCommandLine)
+| extend RiskScore =
+    0
+    + iif(TaskRun has_any (LOLBINs), 30, 0)
+    + iif(TaskRun has_any (SuspiciousPaths), 50, 0)
+    + iif(ProcessCommandLine has "/ru system", 20, 0)
+| where RiskScore >= 50
+| extend Hunter_Directive = case(
+    RiskScore >= 70, "Scheduled Task persistence via LOLBIN",
+    "Suspicious Scheduled Task creation"
+)
+| project TimeGenerated, DeviceName, TaskRun, RiskScore, Hunter_Directive, ProcessCommandLine
