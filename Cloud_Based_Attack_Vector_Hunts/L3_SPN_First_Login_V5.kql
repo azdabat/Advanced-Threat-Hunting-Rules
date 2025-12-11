@@ -1,0 +1,21 @@
+// Rule: L3_SPN_First_Login_V5
+// Author: Ala Dabat
+// Purpose: Detect first-ever SPN logins.
+// Data: AADServicePrincipalSignInLogs
+// MITRE: T1078.004, T1098
+
+let history = 30d;
+let lookback = 24h;
+
+let Logins = AADServicePrincipalSignInLogs
+| where TimeGenerated > ago(history);
+
+let FirstSeen = Logins
+| summarize FirstSeen=min(TimeGenerated) 
+    by ServicePrincipalId, ServicePrincipalName;
+
+FirstSeen
+| where FirstSeen > ago(lookback)
+| extend Severity="Medium", RiskScore=50,
+         Hunter_Directive=strcat("First login for SPN '", ServicePrincipalName, "'")
+| project Severity, RiskScore, ServicePrincipalId, ServicePrincipalName, FirstSeen, Hunter_Directive
