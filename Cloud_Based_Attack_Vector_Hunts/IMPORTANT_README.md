@@ -140,8 +140,9 @@ sequenceDiagram
     Cloud-->>SOC: Cloud App Hijack Rule triggers (Secret Added → SPN Login)
 
     Attacker->>CorpNetwork: Privilege Escalation + Lateral Movement
+```
 
-graph TD
+```graph TD
     A1[Initial Access<br/>T1078 Valid Accounts]:::init
     A2[T1133 External Remote Services]:::init
 
@@ -166,7 +167,7 @@ graph TD
     classDef priv fill:#b3d1ff,stroke:#333;
     classDef cred fill:#fff5b3,stroke:#333;
     classDef ev fill:#e0e0e0,stroke:#333;
-
+```
 Cloud Detection Rules — Sentinel
 
 | Rule Name                        | Purpose                                   | Detects                       | MITRE               |
@@ -198,9 +199,9 @@ flowchart TD
 
     Q3 -->|Yes| CONF[Sentinel Cloud Rule<br/>App Secrets / SPN / OAuth / Roles]
     Q3 -->|No| OTHER[Use another telemetry source<br/>Firewall, proxy, CASB, custom logs]
-
+```
 # QUICK GUIDE
-
+```
 | Scenario                     | Example                               | Correct Rule Type | Why                          |
 | ---------------------------- | ------------------------------------- | ----------------- | ---------------------------- |
 | First-time VPN login         | User logs in from Brazil at 3AM       | Cloud             | Authentication-based anomaly |
@@ -211,7 +212,7 @@ flowchart TD
 | rundll32 loads DLL from TEMP | `evil.dll,#1`                         | MDE               | Execution attack             |
 
 # Incident Response SOP (NIST 800-61)
-flowchart TD
+```flowchart TD
     A[Detection & Analysis] --> B[Containment]
     B --> C[Eradication]
     C --> D[Recovery]
