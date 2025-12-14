@@ -1,91 +1,123 @@
+// ============================================================================
+// L3_DLL_BYOVD_High_Fidelity (DLL Sideloading & Persistence Hunt)
+// Author: Ala Dabat 
+// Purpose: Detect the full chain: File Drop/Download -> DLL Sideload -> Persistence.
+// Data: DeviceFileEvents, DeviceImageLoadEvents, DeviceRegistryEvents, DeviceNetworkEvents
+// MITRE: T1574.001 (DLL Sideloading), T1543.003 (Windows Service), T1105 (Ingress)
+// ============================================================================
+
 let lookback = 14d;
-let suspicious_folders = dynamic(["C:\\ProgramData\\", "C:\\Users\\", "C:\\Temp\\", "C:\\Windows\\Tasks\\"]);
-let writable_driver_locations = dynamic(["C:\\ProgramData\\", "C:\\Users\\", "C:\\Temp\\", "C:\\Windows\\Tasks\\"]);
-let registry_keywords = dynamic([".dll", ".exe", ".ps1", ".bat", ".vbs", ".cmd", ".js", "rundll32.exe", "mshta.exe", "powershell.exe", "cmd.exe"]);
-let known_malicious_hashes = dynamic(["f1e2d3c4b5a6..."]); // replace with threat intel feed
-let now = datetime("2025-11-11T13:21:25Z");
-let cutoff_dormant = now - 7d;
-let confidence_threshold = 3;
+let CorrelationWindow = 5m; // Tight time window for immediate execution/persistence
+let DormantDays = 7d;
+let WritableUserPaths = dynamic([
+    "c:\\programdata\\", "c:\\users\\", "c:\\temp\\", 
+    "c:\\windows\\temp\\", "c:\\windows\\tasks\\", "\\appdata\\local\\temp\\"
+]);
 
-// Step 1: File drops (DLL or Driver)
-let file_drops = DeviceFileEvents
+// --- CONFIGURATION: WHITELISTS ---
+// Known benign files that often drop or load DLLs (E.g., VS Code, trusted installers)
+let BenignLoaders = dynamic(["code.exe", "msiexec.exe", "setup.exe", "trustedinstaller.exe"]);
+// Specific Registry Persistence keys for high-fidelity hunting
+let PersistenceKeys = dynamic([
+    "\\run\\", "\\runonce\\", "\\winlogon\\shell", "\\winlogon\\userinit", "\\currentversion\\windows\\load",
+    "\\services\\" // For driver/service persistence
+]);
+
+// ============================================================================
+// 1. CORE SPINE: File Drops (DLL or Driver)
+// Projects Process info (PID/Hash) to enable tight correlation.
+// ============================================================================
+let FileDrops = DeviceFileEvents
 | where Timestamp >= ago(lookback)
-| where FolderPath startswith_any (suspicious_folders)
 | where FileName endswith ".dll" or FileName endswith ".sys"
-| extend FileExt = tostring(split(FileName, ".", -1)[-1])
-| extend IsDriver = iff(FileName endswith ".sys", 1, 0)
-| extend IsDLL = iff(FileName endswith ".dll", 1, 0)
-| project DropTime = Timestamp, DeviceName, FileName, FileHash, FolderPath, IsDriver, IsDLL, InitiatingProcessFileName;
+| where FolderPath has_any (WritableUserPaths)
+| extend DropperSHA1 = InitiatingProcessSHA1, DropperPid = InitiatingProcessId
+| project DropTime = Timestamp, DeviceId, DeviceName, FileName, FileHash=SHA1, FolderPath, 
+          IsDriver = iff(FileName endswith ".sys", 1, 0), DropperSHA1, DropperPid;
 
-// Step 2: DLL / SYS image loads
-let image_loads = DeviceImageLoadEvents
+// ============================================================================
+// 2. CORRELATION SOURCES (Linked by Time/Process Context)
+// ============================================================================
+
+// A. DLL Sideload Signature: Signed Executable loading from a Writable Path
+let SideloadLoads = DeviceImageLoadEvents
 | where Timestamp >= ago(lookback)
-| where ImageFileName endswith ".dll" or ImageFileName endswith ".sys"
-| where (Signed == "False" or isnull(Signer) or SignatureStatus has_any ("Unsigned", "Unknown", "Invalid"))
-| project LoadTime = Timestamp, DeviceName, ProcessName, ImageFileName, ImageHash;
+| where ImageFileName endswith ".dll"
+// T1574.001: Loader is SIGNED but Image Load Path is SUSPICIOUS
+| where InitiatingProcessSignatureStatus == "Signed" and InitiatingProcessFileName !in~ (BenignLoaders)
+| where FolderPath has_any (WritableUserPaths)
+| extend LoaderSHA1 = InitiatingProcessSHA1, LoaderPid = InitiatingProcessId
+| project LoadTime = Timestamp, DeviceId, ImageHash=SHA1, LoaderSHA1, LoaderPid;
 
-// Step 3: Registry Persistence Indicators
-let reg_persistence = DeviceRegistryEvents
+// B. High-Fidelity Registry Persistence
+let Persistence = DeviceRegistryEvents
 | where Timestamp >= ago(lookback)
-| where RegistryValueData has_any (registry_keywords)
-| project RegTime = Timestamp, DeviceName, RegistryKey, RegistryValueData, InitiatingProcessFileName;
+| where RegistryKey has_any (PersistenceKeys)
+| extend PersistenceSHA1 = InitiatingProcessSHA1, PersistencePid = InitiatingProcessId
+| project RegTime = Timestamp, DeviceId, PersistenceSHA1, PersistencePid, RegistryKey, RegistryValueData;
 
-// Step 4: Network Downloads
-let net_downloads = DeviceNetworkEvents
+// C. Network Downloads (Source of the payload)
+let Downloads = DeviceNetworkEvents
 | where Timestamp >= ago(lookback)
-| where RemoteUrl has_any (".dll", ".sys", ".exe", ".bin")
-| project DownloadTime = Timestamp, DeviceName, RemoteUrl, InitiatingProcessFileName;
+| where RemoteUrl has_any (".dll", ".sys", ".exe")
+| extend DownloaderSHA1 = InitiatingProcessSHA1, DownloaderPid = InitiatingProcessId
+| project DownloadTime = Timestamp, DeviceId, DownloaderSHA1, DownloaderPid, RemoteUrl;
 
-// Step 5: Correlate DLL Loads ↔ File Drops
-file_drops
-| join kind=leftouter (image_loads) on $left.DeviceName == $right.DeviceName and $left.FileHash == $right.ImageHash
-| join kind=leftouter (net_downloads) on $left.DeviceName == $right.DeviceName
-| join kind=leftouter (reg_persistence) on $left.DeviceName == $right.DeviceName
-| extend LoadDelayMin = datetime_diff("minute", LoadTime, DropTime)
-| extend
-    SuspiciousDLLFast = iff(IsDLL == 1 and LoadDelayMin >= 0 and LoadDelayMin <= 5, 1, 0),
-    DormantDriver = iff(IsDriver == 1 and DropTime <= ago(7d) and (isnull(LoadTime) or LoadTime > now), 1, 0),
-    ConfidenceScore = 
-        iif(FileHash in (known_malicious_hashes), 5,
-        iif(FolderPath startswith_any (writable_driver_locations), 2, 0) +
-        iif(isnotempty(RegistryKey), 2, 0) +
-        iif(RemoteUrl has_any (".dll", ".sys"), 1, 0) +
-        iif(SuspiciousDLLFast == 1, 2, 0) +
-        iif(DormantDriver == 1, 3, 0)),
-    Reason =
-        case(
-            FileHash in (known_malicious_hashes), " Known Malicious Hash",
-            SuspiciousDLLFast == 1, " DLL loaded <5m after drop",
-            DormantDriver == 1, "Driver dormant >7d and unused",
-            isnotempty(RegistryKey), " Registry Persistence",
-            RemoteUrl has_any (".dll", ".sys"), " Remote download",
-            FolderPath startswith_any(writable_driver_locations), " Dropped in writable folder",
-            "—"
-        ),
-    MITRE_Techniques =
-        strcat_array(
-            array_distinct(
-                pack_array(
-                    iff(SuspiciousDLLFast == 1, "T1574.001", ""),
-                    iff(DormantDriver == 1, "T1543.003", ""),
-                    iff(isnotempty(RegistryKey), "T1547.001", ""),
-                    iff(RemoteUrl has_any (".dll", ".sys"), "T1105", "")
-                )
-            ),
-            ", "
-        ),
-    ThreatHunterNotes = strcat(
-        iff(SuspiciousDLLFast == 1, " DLL rapidly executed after drop. ", ""),
-        iff(DormantDriver == 1, " Driver dormant >7 days with no load. ", ""),
-        iff(FolderPath startswith_any(writable_driver_locations), "File dropped in user-writable location. ", ""),
-        iff(isnotempty(RegistryKey), strcat("Registry Persistence Key: ", RegistryKey, ". "), ""),
-        iff(isnotempty(RemoteUrl), strcat("Downloaded from: ", RemoteUrl, ". "), "")
-    )
-| where ConfidenceScore >= confidence_threshold
-| project 
-    DropTime, LoadTime, DownloadTime, RegTime,
-    DeviceName, FileName, FileHash, FolderPath, ImageFileName,
-    LoadDelayMin, RemoteUrl, RegistryKey, RegistryValueData,
-    SuspiciousDLLFast, DormantDriver,
-    ConfidenceScore, Reason, ThreatHunterNotes, MITRE_Techniques
+// ============================================================================
+// 3. CORRELATION & SCORING
+// ============================================================================
+FileDrops
+// Join 1: Correlate File Drop with Sideload (Same Hash, Short Time Window)
+| join kind=leftouter (SideloadLoads) on DeviceId and $left.FileHash == $right.ImageHash
+| where isnull(LoadTime) or (LoadTime between (DropTime .. DropTime + CorrelationWindow))
+| extend HasSideload = iif(isnotempty(LoadTime), 1, 0)
+
+// Join 2: Correlate Persistence (Dropper process created the Reg Key within 5m)
+| join kind=leftouter (Persistence) on DeviceId and $left.DropperSHA1 == $right.PersistenceSHA1
+| where isnull(RegTime) or (RegTime between (DropTime .. DropTime + CorrelationWindow))
+| extend HasPersistence = iif(isnotempty(RegistryKey), 1, 0)
+
+// Join 3: Correlate Download (Download happened before the drop, by the same process)
+| join kind=leftouter (Downloads) on DeviceId and $left.DropperSHA1 == $right.DownloaderSHA1
+| where isnull(DownloadTime) or (DownloadTime between (DownloadTime - CorrelationWindow .. DownloadTime)) // Download preceded the drop
+| extend HasDownload = iif(isnotempty(RemoteUrl), 1, 0)
+
+// Scoring based on combined evidence
+| extend ConfidenceScore =
+    0
+    + iif(HasSideload == 1, 4, 0)           // T1574.001 confirmed
+    + iif(HasPersistence == 1, 3, 0)        // T1547.001 confirmed
+    + iif(HasDownload == 1, 2, 0)           // T1105 confirmed
+    + iif(IsDriver == 1, 1, 0)              // BYOVD risk
+    // Dormant Driver Logic: Dropped long ago, never loaded, and persistence was created
+    + iif(IsDriver == 1 and DropTime <= ago(DormantDays) and isnull(LoadTime) and HasPersistence == 1, 5, 0)
+
+| extend Severity = case(
+    ConfidenceScore >= 7, "CRITICAL",  // Sideload + Persistence/Download/Dormancy
+    ConfidenceScore >= 4, "HIGH",      // Confirmed Sideload
+    "MEDIUM"
+)
+
+// ============================================================================
+// 4. FINAL PROJECTION & DIRECTIVES
+// ============================================================================
+| where ConfidenceScore >= 4 // Only show High or Critical events
+| extend HunterDirective = case(
+    Severity == "CRITICAL",
+        strcat("CRITICAL: Full Killchain Detected (Sideload + Persistence/Dormancy). Immediate isolation required. Persistence Key: ", tostring(RegistryKey)),
+    HasSideload == 1 and HasPersistence == 1,
+        strcat("HIGH: Confirmed DLL Sideload (T1574.001) followed by Registry Persistence (T1547.001). Review loader process PID and network connections."),
+    IsDriver == 1 and DropTime <= ago(DormantDays) and HasPersistence == 1,
+        strcat("HIGH: Dormant BYOVD Driver (", FileName, ") with Confirmed Persistence. Driver loaded for kernel attack is imminent."),
+    HasSideload == 1,
+        strcat("HIGH: Confirmed DLL Sideloading. Signed binary loaded ", FileName, " from user path. Investigate the parent process for suspicious IOCTL or code injection."),
+    "MEDIUM: Correlated file drop and persistence, but execution not confirmed. Review file integrity."
+)
+| project
+    DropTime, LoadTime, RegTime,
+    Severity, DeviceName, AccountName=InitiatingProcessAccountName,
+    FileName, FolderPath, FileHash,
+    SideloadSignature = iif(HasSideload==1, "SIGNED_EXE_LOADED_FROM_USER_PATH", "N/A"),
+    HasPersistence, HasDownload, IsDriver,
+    ConfidenceScore, HunterDirective
 | order by DropTime desc
