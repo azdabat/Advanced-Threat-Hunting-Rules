@@ -1,0 +1,85 @@
+// ============================================================================
+// AMSI EFFECTIVENESS / BYPASS OUTCOME HUNT (L3)
+// Author: Ala Dabat (Extended)
+// Purpose:
+//   Detect REAL-WORLD AMSI failure scenarios:
+//   - Script execution without AMSI telemetry
+//   - Encoded / reflective execution followed by network or injection
+//   - Native loaders bypassing AMSI entirely
+//
+// MITRE:
+//   TA0005 Defense Evasion
+//   T1562.001 Disable or Modify Tools
+//   T1059 Command and Scripting Interpreter
+// ============================================================================
+
+let lookback = 7d;
+
+// Script engines that SHOULD invoke AMSI
+let ScriptHosts = dynamic([
+    "powershell.exe","pwsh.exe",
+    "wscript.exe","cscript.exe",
+    "mshta.exe"
+]);
+
+// High-risk execution signals
+let SuspiciousExecTokens = dynamic([
+    "-enc","frombase64string","iex","invoke-expression",
+    "add-type","reflection","assembly.load"
+]);
+
+// 1) Suspicious script execution
+let SuspiciousScripts =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (ScriptHosts)
+| where ProcessCommandLine has_any (SuspiciousExecTokens)
+| project
+    DeviceId,
+    ScriptTime = Timestamp,
+    ScriptPid  = ProcessId,
+    ScriptProc = FileName,
+    ScriptCmd  = ProcessCommandLine;
+
+// 2) Expected AMSI visibility (PowerShell ScriptBlock logging / AMSI events)
+// NOTE: If AMSI was triggered, we expect correlated events shortly after
+let AmsiSignals =
+DeviceEvents
+| where Timestamp >= ago(lookback)
+| where ActionType has_any ("Amsi","ScriptBlock","PowerShell")
+| project DeviceId, AmsiTime = Timestamp;
+
+// 3) Network or injection shortly after script exec
+let PostExecActivity =
+union
+(
+    DeviceNetworkEvents
+    | where Timestamp >= ago(lookback)
+    | project DeviceId, ActTime=Timestamp, ActType="Network", ProcId=InitiatingProcessId
+),
+(
+    DeviceProcessEvents
+    | where Timestamp >= ago(lookback)
+    | where ProcessCommandLine has_any ("VirtualAlloc","WriteProcessMemory","CreateRemoteThread")
+    | project DeviceId, ActTime=Timestamp, ActType="Injection", ProcId=ProcessId
+);
+
+// 4) Correlate: script exec WITHOUT AMSI but WITH post-exec activity
+SuspiciousScripts
+| join kind=leftouter (AmsiSignals) on DeviceId
+| where isnull(AmsiTime) or AmsiTime !between (ScriptTime .. ScriptTime + 2m)
+| join kind=inner (PostExecActivity) on DeviceId, $left.ScriptPid == $right.ProcId
+| where ActTime between (ScriptTime .. ScriptTime + 5m)
+| extend Severity = "High"
+| extend HunterDirective =
+    "HIGH: Suspicious script execution followed by activity, but no AMSI telemetry observed. Possible AMSI bypass or scriptless/native execution. Treat as successful defense evasion."
+| project
+    ScriptTime,
+    DeviceId,
+    ScriptProc,
+    ScriptCmd,
+    ActType,
+    ActTime,
+    Severity,
+    HunterDirective
+| order by ScriptTime desc
