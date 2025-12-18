@@ -1,24 +1,8 @@
-# L3 Threat Hunting SOP: Windows Kernel EoP & BYOVD Correlation
-## Low/Medium → SYSTEM Jump • Vulnerable Driver Staging • Token Elevation
-
-**Author:** Ala Dabat  
-**Version:** 2025.12.Ultimate  
-**Target Platform:** Microsoft Defender XDR / Sentinel (MDE Schema)
-
----
-
-## 1. Executive Summary & Attack Path
-This rule detects the "Kill Chain" of a kernel exploit. It looks for a suspicious driver load (BYOVD) followed immediately by a process integrity jump from Medium to System.
-
-
-
----
-
-## 2. Advanced Correlation Query (KQL)
-
-```kql
 // ============================================================================
 // Hunt Name: L3_Kernel_EoP_BYOVD_Correlation
+//This rule detects the "Kill Chain" of a kernel exploit. It looks for a suspicious driver load (BYOVD) followed immediately by a process integrity jump from Medium to System.
+//Author: Ala Dabat
+//Target Platform:** Microsoft Defender XDR / Sentinel (MDE Schema)
 // Purpose: Correlate Driver Loads with Medium->SYSTEM Process Jumps
 // ============================================================================
 let Lookback = 24h;
