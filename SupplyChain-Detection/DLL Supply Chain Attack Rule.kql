@@ -1,0 +1,280 @@
+// =====================================================================================================
+// L2 / L2.5 CORE+ THREAT HUNT — Supply Chain / Polymorphic Loader (Tight, Low Noise)
+// Author : Ala Dabat
+// WORK IN PROGRESS (untested)
+// Version: 2025-12
+// Type  : THREAT HUNT (Interactive) — NOT Scheduled Analytic
+// Goal  : Provide L2/L2.5 hunters a clean, low-noise entry hunt for:
+//         - Writable-path DLL staging
+//         - Fast drop→load OR drop→delete
+//         - Optional registry persistence correlation (tight window)
+//         - Tenant-local prevalence enrichment (NO FileProfile assumed)
+//         - Ghost module detection (load then delete) as a high-signal escalation trigger
+//
+// Design choices for L2/L2.5:
+//   - Strong time/PID anchoring where possible
+//   - Avoid large fan-out joins
+//   - Use prevalence as TRIAGE (not a filter)
+//   - Keep outputs compact and actionable
+// =====================================================================================================
+
+let lookback = 7d;
+let prevalenceWindow = 30d;        // shorter than L3 for speed; L3 can keep 90d
+let fastLoadSec = 600;             // 10m (L2-friendly, avoids missing slightly delayed installer-like loads)
+let fastDeleteSec = 1800;          // 30m
+let regWindow = 2h;                // tight correlation window around load
+let suspiciousFolders = dynamic([
+  @"C:\Users\",
+  @"C:\ProgramData\",
+  @"C:\Temp\",
+  @"C:\Windows\Temp\"
+]);
+
+let lolbins = dynamic([
+  "rundll32.exe","regsvr32.exe","mshta.exe","powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe"
+]);
+
+// --- Allowlist toggle (keep minimal + verified)
+//     Add enterprise software deployment tools / approved updaters ONLY after validation.
+let KnownGoodInitiators = dynamic([
+  // Examples:
+  // "msiexec.exe","setup.exe","trusted_updater.exe","choco.exe","winget.exe","ccmsetup.exe","intunemanagementextension.exe"
+]);
+
+// --- Registry keys (L2: only highest-signal persistence pivots)
+let CorePersistenceKeyHints = dynamic([
+  @"\InprocServer32",
+  @"\Services\",
+  @"\ServiceDll",
+  @"\AppInit_DLLs",
+  @"\CurrentVersion\Run",
+  @"\CurrentVersion\RunOnce",
+  @"\Image File Execution Options\",
+  @"\KnownDLLs",
+  @"\SafeDllSearchMode"
+]);
+
+// -----------------------------------------------------------------------------------------------------
+// 0) Tenant-local prevalence (triage enrichment) — NO FileProfile assumed
+// -----------------------------------------------------------------------------------------------------
+let TenantPrev =
+DeviceFileEvents
+| where Timestamp >= ago(prevalenceWindow)
+| where isnotempty(SHA256)
+| summarize TenantDeviceCount = dcount(DeviceId), TenantEventCount = count() by SHA256;
+
+// -----------------------------------------------------------------------------------------------------
+// 1) DLL drops in writable paths (staging surface)
+// -----------------------------------------------------------------------------------------------------
+let DllDrops =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FileModified","FileRenamed")
+| where FileName endswith ".dll"
+| where FolderPath has_any (suspiciousFolders)
+| where InitiatingProcessFileName !in~ (KnownGoodInitiators)
+| project
+    DeviceId,
+    DeviceName,
+    DropTime = Timestamp,
+    DroppedDll = FileName,
+    DroppedPath = FolderPath,
+    DroppedSHA256 = SHA256,
+    DropperProc = InitiatingProcessFileName,
+    DropperCmd  = InitiatingProcessCommandLine,
+    DropperPid  = InitiatingProcessId;
+
+// -----------------------------------------------------------------------------------------------------
+// 2) DLL image loads (execution surface) — anchor for correlation
+// -----------------------------------------------------------------------------------------------------
+let DllLoads =
+DeviceImageLoadEvents
+| where Timestamp >= ago(lookback)
+| where ImageFileName endswith ".dll"
+| project
+    DeviceId,
+    LoadTime = Timestamp,
+    LoadedDll = ImageFileName,
+    LoadedSHA256 = coalesce(SHA256, tostring(ImageHash)),
+    LoaderProc = ProcessFileName,
+    LoaderPid  = ProcessId,
+    SignatureStatus,
+    Signer;
+
+// -----------------------------------------------------------------------------------------------------
+// 3) DLL deletes (cleanup / disappearing payload)
+// -----------------------------------------------------------------------------------------------------
+let DllDeletes =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType == "FileDeleted"
+| where FileName endswith ".dll"
+| project
+    DeviceId,
+    DeleteTime = Timestamp,
+    DeletedDll = FileName,
+    DeletedSHA256 = SHA256,
+    DeleterProc = InitiatingProcessFileName;
+
+// -----------------------------------------------------------------------------------------------------
+// 4) Core persistence writes (tight, high-signal keyspace only)
+// -----------------------------------------------------------------------------------------------------
+let RegCore =
+DeviceRegistryEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("RegistryValueSet","RegistryValueAdded")
+| where RegistryKey has_any (CorePersistenceKeyHints)
+| project
+    DeviceId,
+    RegTime = Timestamp,
+    RegistryKey,
+    RegistryValueName,
+    RegistryValueData,
+    RegProc = InitiatingProcessFileName;
+
+// -----------------------------------------------------------------------------------------------------
+// 5) Correlate with minimal fan-out
+//     Prefer hash match, fall back to name match when SHA gaps exist.
+// -----------------------------------------------------------------------------------------------------
+DllDrops
+| join kind=leftouter (TenantPrev) on $left.DroppedSHA256 == $right.SHA256
+| join kind=inner (DllLoads) on DeviceId
+| where
+    (isnotempty(DroppedSHA256) and DroppedSHA256 == LoadedSHA256)
+    or (isempty(DroppedSHA256) and DroppedDll == LoadedDll)
+| extend
+    CreateToLoadSec = tolong(datetime_diff("second", LoadTime, DropTime)),
+    FastDropToLoad  = iif(abs(CreateToLoadSec) <= fastLoadSec, 1, 0)
+| join kind=leftouter (DllDeletes) on DeviceId
+| where
+    // allow rows without delete evidence, but compute disappearing/ghost when present
+    isnull(DeleteTime)
+    or (
+      (isnotempty(DroppedSHA256) and DroppedSHA256 == DeletedSHA256)
+      or (isempty(DroppedSHA256) and DroppedDll == DeletedDll)
+    )
+| extend
+    LoadToDeleteSec = iff(isnotempty(DeleteTime), tolong(datetime_diff("second", DeleteTime, LoadTime)), long(null)),
+    DropToDeleteSec = iff(isnotempty(DeleteTime), tolong(datetime_diff("second", DeleteTime, DropTime)), long(null)),
+    DisappearingPayload = iif(isnotempty(DeleteTime) and DropToDeleteSec between (0..fastDeleteSec), 1, 0),
+    GhostModule = iif(isnotempty(DeleteTime) and isnotempty(LoadToDeleteSec) and LoadToDeleteSec between (0..fastDeleteSec), 1, 0),
+    IsUnsignedOrUnknown = iif(SignatureStatus !in ("Signed","Valid") or isempty(Signer), 1, 0),
+    LoaderIsLOLBIN = iif(tolower(LoaderProc) in~ (lolbins), 1, 0),
+    TenantDeviceCount = coalesce(TenantDeviceCount, 0),
+    PrevalenceHint =
+      case(
+        TenantDeviceCount <= 2, "RARE (<=2 devices)",
+        TenantDeviceCount between (3..10), "LOW (3–10 devices)",
+        TenantDeviceCount >= 50, "COMMON (>=50 devices)",
+        "UNKNOWN (no hash)"
+      )
+| join kind=leftouter (RegCore) on DeviceId
+| where isnull(RegTime) or RegTime between (LoadTime - regWindow .. LoadTime + regWindow)
+| extend
+    RegValLower = tolower(tostring(RegistryValueData)),
+    MentionsThisDll =
+      iif(tolower(tostring(DroppedDll)) != "" and RegValLower has tolower(tostring(DroppedDll)), 1, 0),
+    UserWritableRef =
+      iif(RegValLower has_any ("\\users\\","\\programdata\\","\\appdata\\","\\temp\\"), 1, 0)
+| where
+    // L2/L2.5 keep to "core+" signals:
+    FastDropToLoad == 1
+    or GhostModule == 1
+    or (DisappearingPayload == 1 and IsUnsignedOrUnknown == 1)
+| extend
+    Triage =
+      case(
+        GhostModule == 1 and (IsUnsignedOrUnknown == 1 or MentionsThisDll == 1), "HOT (Ghost Module + Persistence/Unsigned)",
+        GhostModule == 1, "HIGH (Ghost Module)",
+        FastDropToLoad == 1 and IsUnsignedOrUnknown == 1 and PrevalenceHint startswith "RARE", "HIGH (FastLoad + Unsigned + Rare)",
+        FastDropToLoad == 1 and LoaderIsLOLBIN == 1, "MED (FastLoad + LOLBin Loader)",
+        DisappearingPayload == 1, "MED (Drop→Delete)",
+        "LEAD"
+      ),
+    HunterDirective =
+      case(
+        Triage startswith "HOT",
+          "Immediate L3 escalation: rare/unsigned DLL loaded then deleted (ghost) and/or referenced by persistence keys. Preserve memory if possible; scope across tenant by hash and registry key.",
+        Triage startswith "HIGH",
+          "Escalate to L3: validate loader signer mismatch, check DLL path legitimacy, compare against System32 twin DLL if name overlaps, and pivot on registry writes near load time.",
+        Triage startswith "MED",
+          "Validate business context: installer/updater/dev tooling? If no clear justification or prevalence is RARE/LOW, escalate. Capture process tree for loader and dropper.",
+        "Use as a lead: check prevalence and path; document allowlist only after verification."
+      )
+| project
+    LastSeen = coalesce(DeleteTime, LoadTime, RegTime, DropTime),
+    DeviceName,
+    Triage,
+    HunterDirective,
+    PrevalenceHint,
+    TenantDeviceCount,
+    DropTime,
+    LoadTime,
+    DeleteTime,
+    DroppedDll,
+    DroppedPath,
+    DroppedSHA256,
+    DropperProc,
+    DropperCmd,
+    LoaderProc,
+    LoaderPid,
+    SignatureStatus,
+    Signer,
+    IsUnsignedOrUnknown,
+    FastDropToLoad,
+    DisappearingPayload,
+    GhostModule,
+    RegistryKey,
+    RegistryValueName,
+    RegistryValueData,
+    MentionsThisDll,
+    UserWritableRef
+| order by
+    case(Triage startswith "HOT", 4, Triage startswith "HIGH", 3, Triage startswith "MED", 2, 1) desc,
+    LastSeen desc
+;
+
+// -----------------------------------------------------------------------------------------------------
+// IR FRAMEWORK (L2 / L2.5) — Comprehensive (Commented)
+// -----------------------------------------------------------------------------------------------------
+//
+// 1) IDENTIFY (What this hunt is surfacing)
+//    - A DLL staged in a writable path, then loaded quickly (FastDropToLoad) OR removed shortly after (cleanup).
+//    - GhostModule indicates a DLL that was loaded and then deleted soon after, often used by stealth loaders.
+//    - PrevalenceHint is TRIAGE guidance only (not a filter): RARE/LOW increases suspicion.
+//
+// 2) VALIDATE (Fast checks — 2–5 minutes per hit)
+//    - Check DroppedPath: is it expected for this asset type (server vs workstation)?
+//    - Check IsUnsignedOrUnknown: unsigned/unknown signer is higher risk, especially with RARE prevalence.
+//    - Check LoaderProc: is it a normal application for this host? Does it match expected vendor software?
+//    - If RegistryKey is present within ±2h of LoadTime:
+//        - Does RegistryValueData reference the DroppedDll? (MentionsThisDll==1)
+//        - Does it point to writable paths? (UserWritableRef==1)
+//
+// 3) ESCALATE TO L3 (When to hand off)
+//    - Triage == HOT or HIGH
+//    - GhostModule == 1
+//    - FastDropToLoad == 1 AND (IsUnsignedOrUnknown==1 OR PrevalenceHint in ("RARE (<=2 devices)","LOW (3–10 devices)"))
+//    - Any ServiceDll / InprocServer32 / AppInit_DLLs change around load time
+//
+// 4) CONTAIN (If policy allows and corroboration exists)
+//    - For HOT/HIGH with persistence or suspected active compromise:
+//        - Isolate device (MDE) OR restrict network.
+//        - Preserve volatile evidence: request MDE forensic collection / memory capture (L3-led).
+//
+// 5) INVESTIGATE (Scoped pivots L2 can perform)
+//    - Pivot A: search DroppedSHA256 tenant-wide (7–30d) to check spread.
+//    - Pivot B: search same DroppedDll name + path patterns across devices (possible campaign).
+//    - Pivot C: search RegistryKey/ValueName across tenant (COM/service hijack reuse).
+//    - Pivot D: review process tree for LoaderProc and DropperProc around DropTime/LoadTime.
+//
+// 6) ERADICATE/RECOVER (L3 typically, L2 assists)
+//    - Remove persistence entries (registry/service/COM).
+//    - Restore known-good DLL if hijacked; reimage if unsure.
+//    - Reset credentials / revoke tokens if follow-on activity suspected.
+//
+// 7) TUNING GUIDANCE (Reduce noise safely)
+//    - Only add KnownGoodInitiators after verifying with software inventory + signer + path.
+//    - If dev/build endpoints are noisy, scope them with a separate allowlist or device group.
+//    - Keep prevalence as a triage signal; do not hard-filter in hunt mode.
+// =====================================================================================================
