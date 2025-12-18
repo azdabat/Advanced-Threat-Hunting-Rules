@@ -1,0 +1,61 @@
+// ============================================================================
+// L3 Hunt: BYOVD Exploitation Correlation
+// Author: Ala Dabat
+// Audience: L3 Threat Hunters
+// Purpose:
+//   Confirm active kernel exploitation via BYOVD by correlating:
+//     - Known vulnerable/malicious driver load
+//     - Suspicious loader process
+//     - Medium -> SYSTEM privilege transition
+// ============================================================================
+
+let lookback = 24h;
+let CorrelationWindow = 10m;
+let ExpectedLoaders = dynamic(["services.exe","svchost.exe","system","ntoskrnl.exe"]);
+
+// --- LOLDrivers feed ---
+let VulnerableDriverData = externaldata (
+    Category:string, SHA256_Hashes:string, TagsInfo:string
+)["https://www.loldrivers.io/api/drivers.csv"]
+with (format="csv", ignoreFirstRecord=true);
+
+let LOLDrivers =
+VulnerableDriverData
+| extend Hashes = split(SHA256_Hashes, ", "), Tags = split(TagsInfo, ", ")
+| mv-expand Hashes, Tags
+| extend
+    NormalizedSHA256 = tolower(trim(" ", Hashes)),
+    NormalizedFileName = trim_end(".sys", tolower(trim(" ", Tags)))
+| where isnotempty(NormalizedSHA256) or isnotempty(NormalizedFileName);
+
+// --- Driver loads ---
+let DriverLoads =
+DeviceEvents
+| where Timestamp >= ago(lookback)
+| where ActionType has "DriverLoad"
+| extend
+    DriverLoadTime = Timestamp,
+    LoaderProcess = InitiatingProcessFileName,
+    DriverSHA256 = tolower(SHA256),
+    DriverFileName = trim_end(".sys", tolower(FileName))
+| join kind=inner LOLDrivers
+    on $left.DriverSHA256 == $right.NormalizedSHA256
+    or $left.DriverFileName == $right.NormalizedFileName
+| extend SuspiciousLoader = iif(LoaderProcess !in~ (ExpectedLoaders), 1, 0);
+
+// --- Privilege escalation signal ---
+let IntegrityJumps =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where InitiatingProcessIntegrityLevel in ("Low","Medium")
+| where TargetProcessIntegrityLevel == "System"
+| project
+    JumpTime = Timestamp,
+    DeviceId,
+    SourceProcess = InitiatingProcessFileName,
+    TargetProcess = FileName;
+
+// --- Correlate ---
+DriverLoads
+| join kind=inner IntegrityJumps on DeviceId
+| where JumpTime between (DriverLoadTime .. Driver
