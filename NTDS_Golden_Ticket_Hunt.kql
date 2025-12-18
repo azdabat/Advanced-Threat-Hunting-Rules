@@ -1,171 +1,107 @@
-// NTDS / Golden Ticket Hunt — Native Only
+// ============================================================================
+// L3 HUNT — NTDS / DCSYNC / OFFLINE NTDS COLLECTION (BEHAVIOR-FIRST)
 // Author: Ala Dabat
-// work in progress
-// Goal: Find NTDS.dit collection, shadow copies and DCsync / secretsdump-style exfil
+// Audience: L3 Threat Hunters / DFIR
+// Purpose: Detects NTDS.dit collection (offline), shadow copy abuse,
+//          registry-backed persistence, AND live DCSync-style replication
+//          via role-violation (non-DC behaving like DC).
+// Platform: Microsoft Defender XDR (MDE Advanced Hunting)
+// ============================================================================
 
 let lookback = 7d;
+let suspiciousPorts = dynamic([135,389,636,3268,3269,445]);
+let SuspiciousCommands = dynamic(["ntds","ntdsutil","ac i ntds","create full","dcsync","secretsdump","lsadump"]);
+let VssKeywords = dynamic(["shadow","vssadmin","create shadow","delete shadows"]);
 
-// NTDS / shadow-copy keywords
-let SuspiciousCommands = dynamic(["create full","ntds","ntdsutil","ac i ntds"]);
-let VssKeywords        = dynamic(["create shadow","/for=C","delete shadows","shadowcopy"]);
-let NtdsPaths          = dynamic([
-    @"\ntds.dit", @"\Windows\NTDS\", @"\ntds\",
-    @"\AppData\", @"\Downloads\", @"\Desktop\",
-    @"\Temp\", @"\Users\Public\", @"\Windows\"
-]);
-
-// Rough DC identification (tune for your naming)
+// -------------------- Domain Controllers --------------------
 let DomainControllers =
 DeviceInfo
 | summarize arg_max(Timestamp, *) by DeviceId
-| where DeviceName has_cs "DC" or DeviceRole == "DomainController"
-| project DeviceId, DeviceName, IsDC = true;
+| where DeviceRole == "DomainController"
+| project DC_DeviceId = DeviceId, DC_DeviceName = DeviceName;
 
-// 1) NTDS-related tools / commands on any host
-let SuspiciousProcesses =
+// -------------------- Process Intent --------------------
+let ProcSignals =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| where FileName in~ ("ntdsutil.exe","vssadmin.exe","esentutl.exe","wbadmin.exe","mimikatz.exe","python.exe","powershell.exe")
-   or ProcessCommandLine has_any (SuspiciousCommands)
-   or InitiatingProcessCommandLine has_any (SuspiciousCommands)
+| where ProcessCommandLine has_any (SuspiciousCommands)
    or ProcessCommandLine has_any (VssKeywords)
-| extend ProcessRisk =
-    case(
-        FileName =~ "mimikatz.exe", 60,
-        FileName =~ "ntdsutil.exe", 45,
-        FileName =~ "esentutl.exe" or FileName =~ "wbadmin.exe", 35,
-        ProcessCommandLine has_any (SuspiciousCommands) or
-            ProcessCommandLine has_any (VssKeywords), 30,
-        20
-    ),
-    Account = coalesce(InitiatingProcessAccountName, AccountName)
 | project
-    Timestamp,
-    DeviceId, DeviceName, Account,
-    IndicatorType = "Process",
-    Source        = "NTDS_Tool",
-    IndicatorRisk = ProcessRisk,
-    ProcessName   = FileName,
+    DeviceId, DeviceName,
+    ProcTime = Timestamp,
+    ProcessName = FileName,
     ProcessCommandLine,
-    ParentProcessName  = InitiatingProcessFileName,
-    ParentCommandLine  = InitiatingProcessCommandLine;
+    Account = coalesce(AccountName, InitiatingProcessAccountName),
+    ProcRisk = case(
+        ProcessCommandLine has "dcsync", 50,
+        ProcessCommandLine has "ntdsutil", 40,
+        ProcessCommandLine has_any (VssKeywords), 30,
+        20
+    );
 
-// 2) NTDS file access / staging
-let SuspiciousFiles =
+// -------------------- NTDS / Shadow Copy File Access --------------------
+let FileSignals =
 DeviceFileEvents
 | where Timestamp >= ago(lookback)
-| where FileName has_cs "ntds.dit"
-   or FolderPath has_any (NtdsPaths)
-| where InitiatingProcessFileName !in~ ("TiWorker.exe") // basic noise cut
-| extend FileRisk =
-    case(
-        FolderPath has_cs @"\Windows\NTDS\", 50,              // live DB
-        FolderPath has_any (dynamic(["\Temp\","\Users\Public\","\Downloads\"])), 40, // staging paths
-        25
-    ),
-    Account = InitiatingProcessAccountName
+| where FileName has "ntds.dit"
+   or FolderPath has @"\Windows\NTDS\"
 | project
-    Timestamp,
-    DeviceId, DeviceName, Account,
-    IndicatorType = "File",
-    Source        = "NTDS_File",
-    IndicatorRisk = FileRisk,
-    FileName,
-    FolderPath,
-    FileAction    = ActionType,
-    FileProcName  = InitiatingProcessFileName,
-    FileProcCmd   = InitiatingProcessCommandLine;
+    DeviceId, DeviceName,
+    FileTime = Timestamp,
+    FileName, FolderPath,
+    FileProc = InitiatingProcessFileName,
+    FileCmd  = InitiatingProcessCommandLine,
+    FileRisk = 40;
 
-// 3) Network patterns (DCSync / secretsdump style)
-let SuspiciousNetwork =
+// -------------------- Replication-like Network (Role Violation) --------------------
+let ReplicationNetwork =
 DeviceNetworkEvents
 | where Timestamp >= ago(lookback)
-| where
-    InitiatingProcessCommandLine has_any ("secretsdump.py","secret_dump","Invoke-Mimikatz","dcsync") or
-    RemotePort in (135,139,389,445,636,3268,3269)
-| extend NetRisk =
-    case(
-        InitiatingProcessCommandLine has_any ("secretsdump.py","dcsync"), 50,
-        RemotePort in (389,636,3268,3269), 35,
-        RemotePort in (135,139,445), 25,
-        15
-    ),
-    Account = InitiatingProcessAccountUpn
+| where RemotePort in (suspiciousPorts)
 | project
-    Timestamp,
-    DeviceId, DeviceName, Account,
-    IndicatorType = "Network",
-    Source        = "NTDS_Network",
-    IndicatorRisk = NetRisk,
+    DeviceId, DeviceName,
+    NetTime = Timestamp,
     RemoteIP, RemotePort,
-    NetProcName  = InitiatingProcessFileName,
-    NetProcCmd   = InitiatingProcessCommandLine;
+    NetProc = InitiatingProcessFileName,
+    NetCmd  = InitiatingProcessCommandLine;
 
-// 4) Correlate network with process/file activity on same host
-let StageA =
-union
-    (SuspiciousProcesses | project DeviceId, DeviceName, Account, StageTime = Timestamp, StageRisk = IndicatorRisk, StageType = IndicatorType),
-    (SuspiciousFiles     | project DeviceId, DeviceName, Account, StageTime = Timestamp, StageRisk = IndicatorRisk, StageType = IndicatorType);
-
-let CorrelatedNetwork =
-SuspiciousNetwork
-| join kind=inner (
-    StageA
-) on DeviceId, DeviceName, Account
-| where Timestamp between (StageTime .. StageTime + 15m)
-| extend IndicatorRisk = IndicatorRisk + StageRisk + 20,
-         IndicatorType = "Network",
-         Source        = "NTDS_Network_Correlated",
-         Correlated    = true;
-
-// 5) Combine, score, map kill chain & summarise per device/account
-let AllIndicators =
-union
-    SuspiciousProcesses,
-    SuspiciousFiles,
-    CorrelatedNetwork
-| join kind=leftouter DomainControllers on DeviceId
-| extend IsDC = coalesce(IsDC, false),
-         DCBoost = iif(IsDC, 20, 0),
-         Correlated = iif(isnull(Correlated), false, Correlated),
-         FinalScore = IndicatorRisk + DCBoost + iif(Correlated, 10, 0);
-
-AllIndicators
+let NonDC_To_DC =
+ReplicationNetwork
+| join kind=inner DomainControllers on $left.RemoteIP == $right.DC_DeviceName
+| join kind=leftanti DomainControllers on DeviceId
 | summarize
-    FirstSeen       = min(Timestamp),
-    LastSeen        = max(Timestamp),
-    MaxScore        = max(FinalScore),
-    IndicatorTypes  = make_set(IndicatorType),
-    Sources         = make_set(Source),
-    TotalIndicators = count(),
-    CorrelatedEvents = countif(Correlated == true),
-    SampleEvents    = make_list(pack_all(), 10)
-  by DeviceName, IsDC, Account
-| extend KillChainStage =
-    case(
-        CorrelatedEvents > 0 and set_has_element(IndicatorTypes, "File") and set_has_element(IndicatorTypes, "Network"),
-            "Collection + Exfiltration (NTDS / DCSync)",
-        set_has_element(IndicatorTypes, "File") and IsDC,
-            "Collection on Domain Controller (NTDS / shadow copy)",
-        set_has_element(IndicatorTypes, "Network"),
-            "Credential access over network (DCSync / secretsdump)",
-        set_has_element(IndicatorTypes, "Process"),
-            "Collection / backup tooling on host",
-        "Suspicious activity"
-    )
-| extend Severity =
-    case(
-        MaxScore >= 90, "CRITICAL",
-        MaxScore >= 70, "HIGH",
-        MaxScore >= 40, "MEDIUM",
+    ReplicationHits = count(),
+    TargetDCs = make_set(RemoteIP),
+    PortsUsed = make_set(RemotePort)
+  by DeviceId, DeviceName;
+
+// -------------------- Correlation & Scoring --------------------
+ProcSignals
+| join kind=leftouter FileSignals on DeviceId
+| join kind=leftouter NonDC_To_DC on DeviceId
+| extend
+    RoleViolation = iif(isnotempty(TargetDCs), 1, 0),
+    ConfidenceScore =
+        ProcRisk
+      + iif(isnotempty(FileName), 30, 0)
+      + iif(RoleViolation == 1, 30, 0),
+    Severity = case(
+        ConfidenceScore >= 90, "CRITICAL",
+        ConfidenceScore >= 70, "HIGH",
+        ConfidenceScore >= 40, "MEDIUM",
         "LOW"
     )
-| extend HuntingDirectives = pack_array(
-    strcat("Device=", DeviceName, " | Account=", Account, " | IsDC=", tostring(IsDC)),
-    strcat("Kill chain stage: ", KillChainStage, " | Severity: ", Severity, " | MaxScore=", tostring(MaxScore)),
-    "Review SampleEvents for ntdsutil/vssadmin/backup tools touching NTDS paths.",
-    "Check for secretsdump/DCsync-style commands and high-volume LDAP/SMB from this host to DCs.",
-    "If activity is not part of documented backup/DR, treat as domain compromise candidate and rotate KRBTGT / privileged accounts."
-)
-| where MaxScore >= 40
-| order by MaxScore desc, LastSeen desc
+| where ConfidenceScore >= 40
+| project
+    Timestamp = coalesce(NetTime, FileTime, ProcTime),
+    DeviceName,
+    Account,
+    Severity,
+    ConfidenceScore,
+    ProcessName,
+    ProcessCommandLine,
+    FileName,
+    FolderPath,
+    TargetDCs,
+    PortsUsed
+| order by ConfidenceScore desc
