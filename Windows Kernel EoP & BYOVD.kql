@@ -45,13 +45,11 @@ DriverLoads
 
 
 
-// (IR Framework)
+//INCIDENT RESPONSE
 
 //Phase 1: Triage & Validation
 //The "Jump" Logic:** Verify the `SourceProcess`. If `powershell.exe` spawned a `SYSTEM` process like `cmd.exe` or `whoami.exe` within 10 minutes of an unsigned driver loading, this is a **99% confirmed exploit**.
 //Driver Reputation:** Check the `DriversLoaded` list. Search for these drivers on [LOLDrivers.io](https://loldrivers.io). If the driver is listed there, it is a confirmed BYOVD attack.
-
-
 
 //Phase 2: Containment
 //Isolate Host:** Kernel exploits often allow attackers to disable EDR sensors or hide processes. **Isolate the device immediately** via the Defender portal.
@@ -60,17 +58,13 @@ DriverLoads
 //Phase 3: Investigation (Forensic Pivot)
 //Timeline Analysis:** Look for network connections (`DeviceNetworkEvents`) initiated by the `TargetProcess`. Kernel exploits are often followed by immediate credential dumping (`lsass.exe` access).
 
-
-
 //Phase 4: Eradication & Recovery
 //1. **Remove Driver:** Delete the malicious `.sys` file from the disk.
 //2. **Registry Cleanup:** Check `HKLM\SYSTEM\CurrentControlSet\Services` for any new entries related to the suspicious driver.
 //3. **Reimage:** Because kernel memory may have been patched/tampered with (e.g., DKOM - Direct Kernel Object Manipulation), a **full reimage** of the OS is the only way to ensure 100% eradication.
 
-
 // 4. Analyst Notes
 //False Positives:** Legitimate low-level monitoring tools (e.g., CPU-Z, HWMonitor) use vulnerable drivers. Check if the `SourceProcess` is a known IT management tool.
 //Signature Bypass:** Some modern exploits use **Expired Certificates** to sign drivers. Always check the `SignatureStatus` field in your triage.
 
----
-**END OF SOP**
+
