@@ -1,299 +1,169 @@
-// =============================================================
-// NTDS / Golden Ticket Detection with TI Correlation & Hunter Directives
-// Author: Ala Dabat
-// Purpose: Detect NTDS.dit access/exfil + Golden Ticket staging (process, file, network)
-// Tables: DeviceProcessEvents, DeviceFileEvents, DeviceNetworkEvents, DeviceInfo, ThreatIntelligenceIndicator
-// =============================================================
+// ============================================================================
+// CORE HUNT — NTDS / Domain Credential Dumping (Behaviour-Only) — HARDENED
+// Author: Ala Dabat (hardened)
+// Purpose: Detect behaviour consistent with NTDS.dit extraction attempts.
+// MITRE: T1003.003 (NTDS), T1003.002 (SAM), T1105 (Staging), T1021.002 (SMB Admin Shares)
+// Data: DeviceProcessEvents, DeviceFileEvents (MDE Advanced Hunting / Sentinel)
+// Notes: Balances coverage vs false positives (backup tools, patching, AV).
+// ============================================================================
 
 let lookback = 7d;
+let EnableAllowlist = true;
 
-// Suspicious NTDS / VSS commands and paths
-let suspicious_commands = dynamic(["create full","ntds","ntdsutil","ac i ntds"]);
-let vssadmin_vector   = dynamic(["create shadow","/for=C","delete shadows","shadowcopy"]);
-let ntds_paths        = dynamic([
-    @"\ntds.dit",
-    @"\Windows\NTDS\",
-    @"\ntds\",
-    @"\AppData\",
-    @"\Downloads\",
-    @"\Desktop\",
-    @"\Temp\",
-    @"\Users\Public\",
-    @"\Windows\"
+// ---- Core binaries used in real NTDS dump chains
+let DumpTools = dynamic([
+  "ntdsutil.exe","esentutl.exe","dsamain.exe",
+  "vssadmin.exe","diskshadow.exe","wbadmin.exe",
+  "reg.exe","powershell.exe","pwsh.exe","cmd.exe",
+  "robocopy.exe","xcopy.exe"
 ]);
 
-// Domain Controller heuristic (tune for your environment)
-let DomainControllers =
-    DeviceInfo
-    | summarize arg_max(Timestamp, *) by DeviceId
-    | where DeviceName has_cs "DC" or DeviceRole in ("DomainController")
-    | project DeviceId, DeviceName, IsDC = true;
+// ---- Strong command indicators (keep tight; avoid “everything” keywords)
+let StrongCmdIndicators = dynamic([
+  "ac i ntds","ifm","create full","install from media",
+  "vssadmin create shadow","diskshadow","wbadmin start backup",
+  "\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy",
+  "C:\\Windows\\NTDS\\ntds.dit","\\Windows\\NTDS\\",
+  "secretsdump","impacket"
+]);
 
-// MISP / TI indicators from ThreatIntelligenceIndicator
-let MISPIndicators =
-    ThreatIntelligenceIndicator
-    | where TimeGenerated >= ago(30d)
-    | where IndicatorType in ("FileHash","FileName","IP","URL","Registry")
-    | project TI_Indicator = Indicator,
-              TI_Type      = IndicatorType,
-              TI_Threat    = ThreatType,
-              TI_Confidence = toint(ConfidenceScore),
-              TI_LastSeen  = TimeGenerated;
+// ---- Registry hive exports commonly paired with NTDS extraction
+let HiveIndicators = dynamic([
+  "HKLM\\SAM","HKLM\\SYSTEM","HKLM\\SECURITY",
+  "reg save","reg.exe save","reg.exe export"
+]);
 
-// ----------------------------
-// 1) Suspicious NTDS-related processes (Collection & Prep)
-// ----------------------------
-let SuspiciousProcesses =
-    DeviceProcessEvents
-    | where Timestamp >= ago(lookback)
-    | where FileName in~ ("ntdsutil.exe","vssadmin.exe","esentutl.exe","wbadmin.exe","python.exe","powershell.exe","mimikatz.exe")
-        or ProcessCommandLine has_any (suspicious_commands)
-        or InitiatingProcessCommandLine has_any (suspicious_commands)
-        or ProcessCommandLine has_any (vssadmin_vector)
-    | extend BaseScore =
-        case(
-            FileName =~ "mimikatz.exe", 50,
-            FileName =~ "ntdsutil.exe", 35,
-            FileName =~ "esentutl.exe" or FileName =~ "wbadmin.exe", 30,
-            FileName =~ "python.exe" or FileName =~ "powershell.exe" or FileName =~ "vssadmin.exe", 30,
-            15
-        )
-    | project
-        Timestamp,
-        DeviceId,
-        DeviceName,
-        FileName,
-        ProcessCommandLine,
-        InitiatingProcessFileName,
-        InitiatingProcessCommandLine,
-        AccountName,
-        InitiatingProcessAccountName,
-        ProcessId,
-        IndicatorType = "Process",
-        BaseScore;
+// ---- Sensitive source locations
+let SensitiveSources = dynamic([
+  "\\Windows\\NTDS\\",
+  "\\System32\\config\\"
+]);
 
-// TI enrichment for processes (FileName / FileHash)
-let SuspiciousProcessesEnriched =
-    SuspiciousProcesses
-    | join kind=leftouter (
-        MISPIndicators
-        | where TI_Type in ("FileName","FileHash")
-    ) on $left.FileName == $right.TI_Indicator
-    | extend TI_Score = iif(isnotempty(TI_Indicator), coalesce(TI_Confidence, 50), 0)
-    | extend TotalScore = BaseScore + TI_Score;
+// ---- Suspicious staging destinations
+let SuspiciousDestDirs = dynamic([
+  "\\Users\\Public\\","\\ProgramData\\","\\Windows\\Temp\\","\\Temp\\",
+  "\\Downloads\\","\\Desktop\\","\\AppData\\Local\\Temp\\","\\AppData\\Roaming\\"
+]);
 
-// ----------------------------
-// 2) Suspicious NTDS file access / copies (Collection)
-// ----------------------------
-let SuspiciousFiles =
-    DeviceFileEvents
-    | where Timestamp >= ago(lookback)
-    | where FileName has_cs "ntds.dit" or FolderPath has_any (ntds_paths)
-    | where InitiatingProcessFileName !in~ ("TiWorker.exe") // noise reduction
-    | extend BaseScore =
-        case(
-            FolderPath has_cs @"\Windows\NTDS\", 50,                                   // live NTDS
-            FolderPath has_any (dynamic(["\\Temp\\","\\Users\\Public\\","\\Downloads\\"])), 40, // staging/exfil
-            25
-        )
-    | project
-        Timestamp,
-        DeviceId,
-        DeviceName,
-        FolderPath,
-        FileName,
-        ActionType,
-        InitiatingProcessFileName,
-        InitiatingProcessCommandLine,
-        InitiatingProcessAccountName,
-        IndicatorType = "File",
-        BaseScore;
+// ---- Allowlist (optional) — tune per tenant
+let AllowedProc = dynamic([
+  "VeeamAgent.exe","Veeam.Backup.exe","wbengine.exe","backupexec.exe",
+  "NetBackup.exe","AcronisAgent.exe","rubrik.exe"
+]);
+let AllowedAccounts = dynamic(["svc-backup","backupsvc","svc-veeam","svc-netbackup"]);
 
-// TI enrichment for files (FileName / FileHash)
-let SuspiciousFilesEnriched =
-    SuspiciousFiles
-    | join kind=leftouter (
-        MISPIndicators
-        | where TI_Type in ("FileName","FileHash")
-    ) on $left.FileName == $right.TI_Indicator
-    | extend TI_Score = iif(isnotempty(TI_Indicator), coalesce(TI_Confidence, 50), 0)
-    | extend TotalScore = BaseScore + TI_Score;
+let IsAllowlisted = EnableAllowlist and (
+  InitiatingProcessFileName in~ (AllowedProc) or AccountName in~ (AllowedAccounts)
+);
 
-// ----------------------------
-// 3) Suspicious network exfil events (Exfiltration / Remote Dump)
-// ----------------------------
-let SuspiciousNetwork =
-    DeviceNetworkEvents
-    | where Timestamp >= ago(lookback)
-    | where
-        InitiatingProcessCommandLine has_any ("Invoke-NinjaCopy","secretsdump.py","secret_dump","A c i ntds","Invoke-Mimikatz","lsadump::dcsync")
-        or RemotePort in (135,139,389,445,636,3268,3269)   // DC / LDAP / SMB / GC
-    | extend BaseScore =
-        case(
-            InitiatingProcessCommandLine has_any ("secretsdump.py","lsadump::dcsync"), 45,
-            RemotePort in (389,636,3268,3269), 35,
-            RemotePort in (135,139,445), 30,
-            20
-        )
-    | project
-        Timestamp,
-        DeviceId,
-        DeviceName,
-        RemoteIP,
-        RemotePort,
-        BytesSent,
-        InitiatingProcessFileName,
-        InitiatingProcessCommandLine,
-        InitiatingProcessAccountName,
-        IndicatorType = "Network",
-        BaseScore;
+// ---------------------------------------------------------------------------
+// 1) PROCESS SIGNALS — VSS/IFM/NTDS tooling + strong indicators
+// ---------------------------------------------------------------------------
+let ProcSignals =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (DumpTools)
+| where not(IsAllowlisted)
+| extend Cmd = tostring(ProcessCommandLine)
+| extend Parent = tostring(InitiatingProcessFileName)
+| extend HasStrong = Cmd has_any (StrongCmdIndicators) or Cmd has_any (HiveIndicators)
+| extend HasVSS = Cmd has_any (dynamic(["vssadmin","diskshadow","HarddiskVolumeShadowCopy"]))
+| extend HasIFM = Cmd has_any (dynamic(["ntdsutil","ifm","ac i ntds","create full","install from media"]))
+| extend HasHive = Cmd has_any (HiveIndicators)
+| extend ProcScore =
+    10
+  + iif(FileName =~ "ntdsutil.exe" and HasIFM, 60, 0)
+  + iif(FileName in~ ("vssadmin.exe","diskshadow.exe","wbadmin.exe") and HasVSS, 45, 0)
+  + iif(FileName =~ "dsamain.exe" and Cmd has_any (dynamic(["/dbpath","/ldapport"])), 40, 0)
+  + iif(FileName =~ "reg.exe" and HasHive, 35, 0)
+  + iif(FileName has_any ("powershell.exe","pwsh.exe") and HasStrong, 25, 0)
+  + iif(Cmd has "\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy", 35, 0)
+| project
+    Ts=Timestamp, DeviceId, DeviceName, AccountName,
+    SignalType="PROC", Process=FileName, Parent, Cmd,
+    ProcScore;
 
-// TI enrichment for network (IP / URL)
-let SuspiciousNetworkEnriched =
-    SuspiciousNetwork
-    | join kind=leftouter (
-        MISPIndicators
-        | where TI_Type in ("IP","URL")
-    ) on $left.RemoteIP == $right.TI_Indicator
-        or $left.InitiatingProcessCommandLine has TI_Indicator
-    | extend TI_Score = iif(isnotempty(TI_Indicator), coalesce(TI_Confidence, 50), 0)
-    | extend TotalScore = BaseScore + TI_Score;
+// ---------------------------------------------------------------------------
+// 2) FILE SIGNALS — NTDS/registry files accessed or staged to suspicious locations
+//     IMPORTANT: Don’t match Temp/Downloads alone; require NTDS/SAM/SYSTEM/SECURITY context.
+// ---------------------------------------------------------------------------
+let FileSignals =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FileModified","FileRenamed","FileCopied")
+| extend Name=tostring(FileName), Path=tostring(FolderPath)
+| extend IsNTDS = Name =~ "ntds.dit" or Path has "\\Windows\\NTDS\\"
+| extend IsHive = Name matches regex @"(?i)^(sam|system|security)\.(save|bak|tmp|old)$" or Path has "\\System32\\config\\"
+| extend IsShadowCopyPath = Path has "\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy"
+| extend IsAdminShare = Path startswith @"\\" and Path has_any (dynamic(["ADMIN$","C$","D$","E$"]))
+| extend IsStagedToSuspiciousDest = Path has_any (SuspiciousDestDirs)
+| where (IsNTDS or IsHive or IsShadowCopyPath) or (IsAdminShare and Name has_any (dynamic(["ntds","dit","sam","system","security"])))
+| where InitiatingProcessFileName !in~ ("TiWorker.exe","MsMpEng.exe","Sense.exe","svchost.exe")
+| extend FileScore =
+    10
+  + iif(IsNTDS, 55, 0)
+  + iif(IsHive, 40, 0)
+  + iif(IsShadowCopyPath, 35, 0)
+  + iif(IsAdminShare, 30, 0)
+  + iif(IsStagedToSuspiciousDest and (IsNTDS or IsHive), 25, 0)
+| project
+    Ts=Timestamp, DeviceId, DeviceName, AccountName=tostring(InitiatingProcessAccountName),
+    SignalType="FILE", Process=tostring(InitiatingProcessFileName),
+    Parent=tostring(InitiatingProcessParentFileName),
+    Cmd=tostring(InitiatingProcessCommandLine),
+    FileName=Name, FolderPath=Path,
+    FileScore;
 
-// ----------------------------
-// 4) Correlate: network within 15m of suspicious process/file
-// ----------------------------
-let StageA_Indicators =
-    union
-        (SuspiciousProcessesEnriched | project DeviceId, DeviceName, StageA_Time = Timestamp, StageA_Type = IndicatorType, StageA_Score = TotalScore),
-        (SuspiciousFilesEnriched     | project DeviceId, DeviceName, StageA_Time = Timestamp, StageA_Type = IndicatorType, StageA_Score = TotalScore);
-
-let CorrelatedNetwork =
-    SuspiciousNetworkEnriched
-    | join kind=inner (
-        StageA_Indicators
-    ) on DeviceId, DeviceName
-    | where Timestamp between (StageA_Time .. StageA_Time + 15m)
-    | extend TotalScore = TotalScore + 20, Correlated = true;
-
-// ----------------------------
-// 5) Combine all indicators + DC boosting
-// ----------------------------
-let AllIndicators =
-    union
-        (SuspiciousProcessesEnriched | extend Correlated = false),
-        (SuspiciousFilesEnriched     | extend Correlated = false),
-        (CorrelatedNetwork)
-    | join kind=leftouter DomainControllers on DeviceId
-    | extend
-        IsDC = iif(isnull(IsDC), false, IsDC),
-        DCBoost   = iif(IsDC == true, 20, 0),
-        FinalScore = TotalScore + DCBoost
-    | extend
-        Severity =
-            case(
-                FinalScore >= 90, "CRITICAL",
-                FinalScore >= 70, "HIGH",
-                FinalScore >= 40, "MEDIUM",
-                "LOW"
-            );
-
-// ----------------------------
-// 6) Summarise per device for SOC triage + Hunter Directives
-// ----------------------------
-AllIndicators
-| summarize
-    FirstSeen = min(Timestamp),
-    LastSeen  = max(Timestamp),
-    TotalScore  = max(FinalScore),
-    Indicators = make_set(IndicatorType),
-    CorrelatedEvents = countif(Correlated == true),
-    SampleEvents = make_list(pack_all(), 10)
-    by DeviceName, IsDC, InitiatingProcessAccountName
-| where TotalScore >= 40   // tune threshold (40 = MEDIUM+)
-| extend
-    Severity =
-        case(
-            TotalScore >= 90, "CRITICAL",
-            TotalScore >= 70, "HIGH",
-            "MEDIUM"
-        )
-| extend ThreatHunterDirective = case(
-    // Full chain: Process + File + Network
-    TotalScore >= 90 and Indicators has "File" and Indicators has "Process" and Indicators has "Network",
-        "CRITICAL: Likely NTDS theft / Golden Ticket staging. Immediately isolate host, suspend accounts, review VSS/shadow copies, check for secretsdump/Impacket use, and validate KRBTGT/hash integrity.",
-    // File + Process (NTDS access on DC / server)
-    TotalScore >= 70 and Indicators has "File" and Indicators has "Process",
-        "HIGH: Suspicious NTDS access with privileged tooling. Investigate device timeline, confirm if backup operations are legitimate, and look for staged copies of ntds.dit or related DB files.",
-    // Network + cred-dump patterns
-    TotalScore >= 70 and Indicators has "Network",
-        "HIGH: Possible remote NTDS dumping or DCsync behaviour. Review network flows, identify calling account, verify domain replication activity, and check for unauthorized use of Impacket/Mimikatz.",
-    // Process-only
-    TotalScore >= 50 and Indicators has "Process",
-        "Investigate suspicious NTDS-related process activity. Inspect command-lines, confirm admin legitimacy, review VSS usage, and check for follow-on credential access.",
-    // File-only
-    TotalScore >= 40 and Indicators has "File",
-        "Investigate NTDS file access/copy. Confirm business justification, validate backup tooling, and ensure no staging to user-writable paths for exfiltration.",
-    // Fallback
-    "Monitor and correlate with future suspicious activity; escalate if additional signals appear."
+// ---------------------------------------------------------------------------
+// 3) COMBINE + SCORE + DIRECTIVES
+// ---------------------------------------------------------------------------
+union isfuzzy=true
+(
+  ProcSignals
+  | extend Score = todouble(ProcScore)
+),
+(
+  FileSignals
+  | extend Score = todouble(FileScore)
 )
-| extend HuntingDirectives = pack_array(
-    strcat("1) Confirm role of ", DeviceName, " (DC or member server) and validate expected backup operations."),
-    "2) Review SampleEvents for ntds.dit access, VSS/shadow copy creation, and suspicious process command-lines.",
-    "3) Look for Impacket, secretsdump.py, Mimikatz, or custom Python tooling in process and network traces.",
-    "4) If NTDS compromise is suspected, isolate the host, rotate KRBTGT twice, and reset privileged accounts.",
-    "5) Hunt laterally for similar tooling, commands, and network patterns across other DCs and key servers.",
-    "6) Feed confirmed hashes, tools, and IPs into MISP/TI to raise confidence on future similar detections."
+| summarize
+    FirstSeen=min(Ts),
+    LastSeen=max(Ts),
+    TotalScore=sum(Score),
+    Signals=make_set(SignalType, 10),
+    Processes=make_set(Process, 15),
+    Parents=make_set(Parent, 15),
+    SampleCmd=any(Cmd),
+    Files=make_set(coalesce(FileName, ""), 10),
+    Paths=make_set(coalesce(FolderPath, ""), 10)
+  by DeviceId, DeviceName, AccountName
+| extend Severity = case(
+    TotalScore >= 120, "CRITICAL",
+    TotalScore >= 80,  "HIGH",
+    TotalScore >= 50,  "MEDIUM",
+    "LOW"
+)
+| extend HuntingDirective = case(
+    Severity == "CRITICAL",
+    "CRITICAL: Strong NTDS/registry dumping chain (VSS/IFM + sensitive file access/staging). Immediately validate legitimacy, isolate if unapproved, acquire memory, and rotate impacted credentials/service accounts.",
+    Severity == "HIGH",
+    "HIGH: Multiple NTDS dump indicators. Confirm whether backup/DR tooling is running; if not, pivot to process tree, shadow copy usage, admin shares, and follow-on exfil/persistence.",
+    Severity == "MEDIUM",
+    "MEDIUM: Partial NTDS/hive access signal. Baseline host role (DC/backup server/admin jumpbox). Promote if paired with VSS creation, hive exports, or admin share staging.",
+    "LOW: Weak signal; keep for baselining and watch for recurrence."
 )
 | project
+    Severity,
+    HuntingDirective,
     FirstSeen,
     LastSeen,
-    Severity,
-    TotalScore,
     DeviceName,
-    IsDC,
-    InitiatingProcessAccountName,
-    Indicators,
-    CorrelatedEvents,
-    ThreatHunterDirective,
-    HuntingDirectives,
-    SampleEvents
+    AccountName,
+    TotalScore,
+    Signals,
+    Processes,
+    Parents,
+    Files,
+    Paths,
+    SampleCmd
 | order by TotalScore desc, LastSeen desc
-
-
-// DCsync detection – suspicious replication requests
-SecurityEvent
-| where TimeGenerated >= ago(7d)
-| where EventID == 4662
-| where ObjectType == "dirReplica" or ObjectName has "Ds-Replica" or ObjectName has "DS-Replication-Get-Changes"
-| where not(AccountType =~ "System")
-| extend IsSuspicious =
-    iif(
-        SubjectUserName !endswith "$" and  // exclude machine accounts (tune)
-        SubjectUserName !in ("NT AUTHORITY\\SYSTEM") and
-        SubjectUserName !has "krbtgt",
-        1, 0)
-| where IsSuspicious == 1
-| summarize
-    FirstSeen = min(TimeGenerated),
-    LastSeen  = max(TimeGenerated),
-    Count = count(),
-    ExampleEvent = any(pack_all())
-    by Computer, SubjectUserName, ObjectName
-| extend Severity = case(Count >= 5, "HIGH", "MEDIUM")
-| order by LastSeen desc
-
-// Remote Impacket / Secretsdump-style SMB against DCs
-SecurityEvent
-| where TimeGenerated >= ago(7d)
-| where EventID in (5156, 5158)  // Windows Filtering Platform allow events (if enabled)
-| where DestinationPort in (135,139,445,389,636,3268,3269)
-| where isnotempty(DestinationIp)
-| extend Src = Coalesce(IpAddress, SourceAddress, SourceIp)
-| summarize
-    FirstSeen = min(TimeGenerated),
-    LastSeen  = max(TimeGenerated),
-    ConnCount = count()
-    by Src, DestinationIp, DestinationPort
-| where ConnCount > 50  // tune threshold
-| order by ConnCount desc, LastSeen desc
-
